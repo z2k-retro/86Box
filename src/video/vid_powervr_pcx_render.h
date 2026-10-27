@@ -48,6 +48,10 @@ typedef struct pcxr_result_t {
     int      min_x, min_y, max_x, max_y; /* rows/columns covered by tiles (inclusive) */
     uint32_t tiles;
     uint32_t pixels_shaded;
+    /* Work the chip does, for the render-time model: every plane in a
+       tile's object list goes through the 32 cells once per span, whatever
+       shortcuts this renderer takes. */
+    uint64_t isp_plane_spans;
     int      error; /* non-zero if the tile list was malformed and rendering stopped */
 } pcxr_result_t;
 

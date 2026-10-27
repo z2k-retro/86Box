@@ -233,6 +233,7 @@ typedef struct pcx_t {
     struct pcx_helper_t {
         struct pcx_t *pcx;
         int           index;
+        uint32_t      shaded; /* pixels shaded in this helper's tiles */
         thread_t     *thread;
         event_t      *go, *done;
     } helper[PCX_MAX_HELPERS];
@@ -241,6 +242,13 @@ typedef struct pcx_t {
     int            render_pending;
     atomic_int     render_ready;   /* set by the render thread when the frame is drawn */
     double         render_late_us; /* emulated time the end of render was held back */
+    double         render_elapsed_us; /* emulated time since STARTRENDER (modelled render time) */
+    /* Render-time model (developer build): the chip's work in the frame
+       and the emulated render time worked out from it. */
+    int            render_model;  /* 0: fixed render_delay_us; 1: modelled */
+    int            core_mhz;      /* PCX2 core clock for the model; the m3D runs at 66 */
+    uint64_t       job_out_bytes, job_out_runs;
+    double         job_model_us;
     int            render_discard;
     uint32_t      *isp_buf;
     uint32_t      *rgb;
@@ -275,6 +283,7 @@ typedef struct pcx_t {
 
     /* Statistics. */
     double   stat_render_ms, stat_render_max_ms, stat_wait_ms, stat_output_ms, stat_late_ms;
+    double   stat_model_ms, stat_model_max_ms;
     uint32_t stat_frames;
     uint32_t frames;
     uint32_t dumps;
@@ -492,7 +501,7 @@ pcx_render_helper(void *priv)
         if (pcx->render_quit)
             break;
         if (pcx->phase == PCX_PHASE_TILES)
-            pcxr_render_tiles(pcx->rjob, pcx->rgb, h->index, pcx->n_helpers + 1);
+            h->shaded = pcxr_render_tiles(pcx->rjob, pcx->rgb, h->index, pcx->n_helpers + 1);
         else
             pcx_pack_rows(pcx, h->index, pcx->n_helpers + 1);
         thread_set_event(h->done);
@@ -580,13 +589,64 @@ pcx_run_phase(pcx_t *pcx, int phase)
     for (int i = 0; i < pcx->n_helpers; i++)
         thread_set_event(pcx->helper[i].go);
     if (phase == PCX_PHASE_TILES)
-        pcxr_render_tiles(pcx->rjob, pcx->rgb, 0, pcx->n_helpers + 1);
+        pcx->job_res.pixels_shaded = pcxr_render_tiles(pcx->rjob, pcx->rgb, 0, pcx->n_helpers + 1);
     else
         pcx_pack_rows(pcx, 0, pcx->n_helpers + 1);
     for (int i = 0; i < pcx->n_helpers; i++) {
         thread_wait_event(pcx->helper[i].done, -1);
         thread_reset_event(pcx->helper[i].done);
+        if (phase == PCX_PHASE_TILES)
+            pcx->job_res.pixels_shaded += pcx->helper[i].shaded;
     }
+}
+
+/* Render-time model (experimental, developer build only).
+
+   The chip's own work is clocked by its core clock: the ISP runs every
+   plane of a tile through its 32 cells once per span, and the TSP shades
+   the visible pixels. The finished pixels go out to the 2D card's frame
+   buffer as bus-master writes on PCI, which the core clock does not speed
+   up. The two overlap, so the frame takes about as long as the slower of
+   them.
+
+   Provisional coefficients, to be fitted to render times measured on the
+   m3D: one core cycle per plane per span, one per shaded pixel, and
+   output at about 81 MB/s, which is what SGLTri's 7.6 ms for a full
+   640x480 16-bit frame implies if that frame is output-bound. */
+#define PCX_MODEL_ISP_CYCLES  1.0  /* per plane per span */
+#define PCX_MODEL_TSP_CYCLES  1.0  /* per shaded pixel */
+#define PCX_MODEL_TILE_CYCLES 0.0  /* per tile */
+#define PCX_MODEL_OUT_MBPS    81.0 /* frame buffer writes over PCI */
+#define PCX_MODEL_RUN_US      0.0  /* per bus-master run */
+#define PCX_MODEL_FIXED_US    0.0  /* per frame */
+
+static double
+pcx_model_us(const pcx_t *pcx)
+{
+    const pcxr_result_t *r = &pcx->job_res;
+    double core_us = (PCX_MODEL_ISP_CYCLES * (double) r->isp_plane_spans
+                      + PCX_MODEL_TSP_CYCLES * (double) r->pixels_shaded
+                      + PCX_MODEL_TILE_CYCLES * (double) r->tiles) / (double) pcx->core_mhz;
+    double out_us  = (double) pcx->job_out_bytes / PCX_MODEL_OUT_MBPS
+                     + PCX_MODEL_RUN_US * (double) pcx->job_out_runs;
+
+    return PCX_MODEL_FIXED_US + ((core_us > out_us) ? core_us : out_us);
+}
+
+/* Bytes and runs the frame sends to the frame buffer (render thread). */
+static void
+pcx_count_output(pcx_t *pcx)
+{
+    uint64_t bytes = 0, runs = 0;
+
+    for (int y = pcx->pack_y0; y <= pcx->pack_y1; y++) {
+        const struct pcx_span_t *sp = &pcx->spans[(uint32_t) y * PCX_ROW_SPANS];
+        for (int i = 0; i < pcx->row_spans[y]; i++)
+            bytes += sp[i].len;
+        runs += pcx->row_spans[y];
+    }
+    pcx->job_out_bytes = bytes;
+    pcx->job_out_runs  = runs;
 }
 
 static void
@@ -609,6 +669,8 @@ pcx_render_thread(void *priv)
         pcx_pack_area(pcx);
         if (pcx->pack_y1 >= pcx->pack_y0)
             pcx_run_phase(pcx, PCX_PHASE_PACK);
+        pcx_count_output(pcx);
+        pcx->job_model_us = pcx_model_us(pcx);
         pcx->job_ms = pcx_now_ms() - pcx->job_start_ms;
         atomic_store(&pcx->render_ready, 1);
         thread_set_event(pcx->render_finished);
@@ -669,6 +731,8 @@ pcx_render_frame(pcx_t *pcx)
     pcx->render_pending = 1;
     pcx->render_discard = 0;
     pcx->render_late_us = 0.0;
+    pcx->job_out_bytes = pcx->job_out_runs = 0;
+    pcx->job_model_us   = 0.0;
     atomic_store(&pcx->render_ready, 0);
     thread_set_event(pcx->render_go);
 }
@@ -716,9 +780,26 @@ pcx_render_done(void *priv)
        could drop timer interrupts, so games that count them ran in slow
        motion while reporting a normal frame rate. */
     if (pcx->render_pending && !atomic_load(&pcx->render_ready)) {
-        pcx->render_late_us += PCX_RENDER_POLL_US;
+        if (!pcx->render_model)
+            pcx->render_late_us += PCX_RENDER_POLL_US;
+        pcx->render_elapsed_us += PCX_RENDER_POLL_US;
         timer_on_auto(&pcx->render_timer, PCX_RENDER_POLL_US);
         return;
+    }
+
+    /* Modelled render time: once the host has drawn the frame, the chip's
+       work is known; the card stays busy until the model says it is done,
+       or until the host finished if that was later. */
+    if (pcx->render_pending && pcx->render_model) {
+        if (pcx->render_elapsed_us < pcx->job_model_us) {
+            double rest = pcx->job_model_us - pcx->render_elapsed_us;
+            pcx->render_elapsed_us = pcx->job_model_us;
+            timer_on_auto(&pcx->render_timer, rest);
+            return;
+        }
+        pcx->render_late_us = pcx->render_elapsed_us - pcx->job_model_us;
+        if (pcx->render_late_us < PCX_RENDER_POLL_US)
+            pcx->render_late_us = 0.0; /* within one poll of the model */
     }
 
     if (pcx->render_pending) {
@@ -736,6 +817,9 @@ pcx_render_done(void *priv)
         pcx->stat_render_ms += pcx->job_ms;
         if (pcx->job_ms > pcx->stat_render_max_ms)
             pcx->stat_render_max_ms = pcx->job_ms;
+        pcx->stat_model_ms += pcx->job_model_us / 1000.0;
+        if (pcx->job_model_us / 1000.0 > pcx->stat_model_max_ms)
+            pcx->stat_model_max_ms = pcx->job_model_us / 1000.0;
         if (++pcx->stat_frames == 100) {
             pcx_log(pcx, PCX_LOG_SUMMARY,
                     "PowerVR: frames %u-%u: render %.1f ms average (%.1f max) on %d thread(s), "
@@ -743,9 +827,15 @@ pcx_render_done(void *priv)
                     "emulated render time %.1f ms + %.1f ms held back for the host\n",
                     pcx->frames - 99, pcx->frames, pcx->stat_render_ms / 100.0, pcx->stat_render_max_ms,
                     pcx->n_helpers + 1, pcx->stat_wait_ms / 100.0, pcx->stat_output_ms / 100.0,
-                    pcx->render_delay_us / 1000.0, pcx->stat_late_ms / 100.0);
+                    pcx->render_model ? pcx->stat_model_ms / 100.0 : pcx->render_delay_us / 1000.0,
+                    pcx->stat_late_ms / 100.0);
+            if (pcx->render_model)
+                pcx_log(pcx, PCX_LOG_SUMMARY,
+                        "PowerVR: render time modelled at %d MHz: %.1f ms average, %.1f max\n",
+                        pcx->core_mhz, pcx->stat_model_ms / 100.0, pcx->stat_model_max_ms);
             pcx->stat_frames = 0;
             pcx->stat_render_ms = pcx->stat_render_max_ms = pcx->stat_wait_ms = pcx->stat_output_ms = pcx->stat_late_ms = 0.0;
+            pcx->stat_model_ms = pcx->stat_model_max_ms = 0.0;
         }
     }
     if (pcx->debug_tile && pcx_bus_master_enabled(pcx)) {
@@ -758,8 +848,12 @@ pcx_render_done(void *priv)
     pcx->int_status |= PCX_INT_FRAME_DONE;
     pcx_update_irq(pcx);
 
-    pcx_log(pcx, PCX_LOG_EVENTS, "PowerVR: frame %u end of render, IRQ %s\n",
-            pcx->frames, pcx->irq_state ? "raised" : "masked");
+    pcx_log(pcx, PCX_LOG_EVENTS, "PowerVR: frame %u end of render, IRQ %s; tiles %u, plane-spans %llu, "
+            "shaded %u, output %llu bytes in %llu runs, model %.2f ms at %d MHz\n",
+            pcx->frames, pcx->irq_state ? "raised" : "masked", pcx->job_res.tiles,
+            (unsigned long long) pcx->job_res.isp_plane_spans, pcx->job_res.pixels_shaded,
+            (unsigned long long) pcx->job_out_bytes, (unsigned long long) pcx->job_out_runs,
+            pcx->job_model_us / 1000.0, pcx->core_mhz);
 }
 
 static void
@@ -788,7 +882,11 @@ pcx_start_render(pcx_t *pcx)
     pcx_render_frame(pcx);
 
     pcx->render_busy = 1;
-    timer_on_auto(&pcx->render_timer, (double) pcx->render_delay_us);
+    /* With the model the time is known only once the host has drawn the
+       frame, so look early and extend from there. */
+    pcx->render_elapsed_us = (pcx->render_model && pcx->render_pending) ? PCX_RENDER_POLL_US
+                                                                         : (double) pcx->render_delay_us;
+    timer_on_auto(&pcx->render_timer, pcx->render_elapsed_us);
 }
 
 static void
@@ -1202,6 +1300,8 @@ pcx_init(const device_t *info)
     pcx->chip           = device_get_config_int("chip");
     pcx->revision_value = (pcx->chip == PCX_CHIP_PCX2) ? device_get_config_int("revision") : 0;
     pcx->render_delay_us = device_get_config_int("render_delay");
+    pcx->render_model   = device_get_config_int("render_model");
+    pcx->core_mhz       = device_get_config_int("core_clock");
     pcx->ack_mode       = device_get_config_int("int_ack");
     pcx->debug_tile     = device_get_config_int("debug_tile");
     pcx->pci_revision   = device_get_config_int("pci_revision");
@@ -1212,6 +1312,8 @@ pcx_init(const device_t *info)
     pcx->chip           = PCX_CHIP_PCX2;
     pcx->revision_value = 1;
     pcx->render_delay_us = 7600;
+    pcx->render_model   = 0;
+    pcx->core_mhz       = 66;
     pcx->ack_mode       = PCX_ACK_READ_CLEARS;
     pcx->debug_tile     = 0;
     pcx->pci_revision   = 1;
@@ -1406,6 +1508,38 @@ static const device_config_t pcx_config[] = {
         .file_filter    = NULL,
         .spinner        = { .min = 10, .max = 30000, .step = 100 },
         .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "render_model",
+        .description    = "Render time model",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "Fixed (render time above)", .value = 0 },
+            { .description = "From the frame's work (experimental)", .value = 1 },
+            { .description = "" }
+        },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "core_clock",
+        .description    = "Core clock (experimental, modelled render time only)",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 66,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "66 MHz (m3D, stock)", .value = 66 },
+            { .description = "75 MHz", .value = 75 },
+            { .description = "80 MHz", .value = 80 },
+            { .description = "90 MHz", .value = 90 },
+            { .description = "" }
+        },
         .bios           = { { 0 } }
     },
     {

@@ -1461,6 +1461,15 @@ pcxr_prepare(pcxr_job_t *job, const pcxr_frame_t *f, pcxr_result_t *res)
         cur_word = local_word + obj_off;
         start    = local_start;
     }
+
+    for (uint32_t ti = 0; ti < job->n_tiles; ti++) {
+        const tile_t *t = &job->tiles[ti];
+        uint32_t      np = 0;
+        for (uint32_t o = t->first_object; o < t->first_object + t->n_objects; o++)
+            np += job->objects[o].count;
+        res->isp_plane_spans += (uint64_t) np * (uint32_t) t->ysize
+                                * (uint32_t) ((t->xsize + NUM_CELLS - 1) / NUM_CELLS);
+    }
     return (int) job->n_tiles;
 }
 
