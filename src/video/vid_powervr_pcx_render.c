@@ -595,6 +595,7 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
     /* BILINEAR[1:0]: 0 bilinear, 1 adaptive bilinear (see below), 3 linear
        mip-mapping (no bilinear filter). */
     int      bilin  = ((c->f->bilinear & 3) != 3);
+    int      vstep  = 1; /* row of the second bilinear sample, v + vstep */
 
     abc = (int32_t) ((uint32_t) a * x + (uint32_t) b * y + (uint32_t) cc * scale);
     def = (int32_t) ((uint32_t) d * x + (uint32_t) e * y + (uint32_t) f * scale);
@@ -629,13 +630,22 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
     /* A texture mirrored in u (flip bit 12) on a mirrored repeat also
        mirrors the bilinear weight: the fraction is inverted while each
        sample's address is mirrored as usual. Measured on the m3D with
-       edited frames, where it makes every u-mirrored pixel match. The v
-       direction does not follow the same rule and is not yet modelled. */
-    if (flip_uv & 2) {
+       edited frames, where it makes every u-mirrored pixel match.
+       Mirrored in v (flip bit 11), the weight is inverted too, but the
+       second row is taken from v - 1 instead of v + 1 (each sample's
+       address again mirrored by its own region). Fitted to Turok and to
+       edited MechWarrior 2 frames on the m3D: it halves the differences,
+       and about half of the v-mirrored pixels still differ by a step or
+       two, so this is not the whole rule. */
+    if (flip_uv & 3) {
         static const int32_t raw_mask[] = { 0x1f, 0x3f, 0x7f, 0xff };
         int32_t              bit        = (map_size == 3) ? 128 : raw_mask[map_size] + 1;
-        if (u & bit)
+        if ((flip_uv & 2) && (u & bit))
             uf = ~uf & 8191;
+        if ((flip_uv & 1) && (v & bit)) {
+            vf    = ~vf & 8191;
+            vstep = -1;
+        }
     }
 
     /* Mip-map level from the squared 1/w. */
@@ -685,9 +695,9 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
             vf &= 31;
             u1   = colour_convert(fetch_pixel(c, level_addr(&lv0, (u + 1) & 255, v)),
                                   colour_depth, (u + 1) & 1, col4444);
-            v1   = colour_convert(fetch_pixel(c, level_addr(&lv0, u, (v + 1) & 255)),
+            v1   = colour_convert(fetch_pixel(c, level_addr(&lv0, u, (v + vstep) & 255)),
                                   colour_depth, u & 1, col4444);
-            u1v1 = colour_convert(fetch_pixel(c, level_addr(&lv0, (u + 1) & 255, (v + 1) & 255)),
+            u1v1 = colour_convert(fetch_pixel(c, level_addr(&lv0, (u + 1) & 255, (v + vstep) & 255)),
                                   colour_depth, (u + 1) & 1, col4444);
             tcol = bilerp(tcol, u1, v1, u1v1, uf, vf);
         }
@@ -727,9 +737,9 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
             vf = (vf >> compress) & 31;
             u1   = colour_convert(fetch_pixel(c, level_addr(&lvc, (u + binc) & 255, v)),
                                   colour_depth, u & 1, col4444);
-            v1   = colour_convert(fetch_pixel(c, level_addr(&lvc, u, (v + binc) & 255)),
+            v1   = colour_convert(fetch_pixel(c, level_addr(&lvc, u, (v + vstep * binc) & 255)),
                                   colour_depth, u & 1, col4444);
-            u1v1 = colour_convert(fetch_pixel(c, level_addr(&lvc, (u + binc) & 255, (v + binc) & 255)),
+            u1v1 = colour_convert(fetch_pixel(c, level_addr(&lvc, (u + binc) & 255, (v + vstep * binc) & 255)),
                                   colour_depth, u & 1, col4444);
             tcol = bilerp(tcol, u1, v1, u1v1, uf, vf);
         }
