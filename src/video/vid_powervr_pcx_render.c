@@ -1126,6 +1126,38 @@ typedef struct {
     int32_t  I_visib[NUM_CELLS], I_forward[NUM_CELLS], shad_temp[NUM_CELLS], U_visib[NUM_CELLS], U_shadow[NUM_CELLS];
 } cells_t;
 
+/* The comparator values of one plane across the span: the low 32 bits of
+   (v0 + cl * a) / 256 for cl = 0..31, where v0 and a are the 40-bit adder's
+   start and step. round: divide rounding toward zero (as the simulator
+   does for depth planes), otherwise floor (an arithmetic shift).
+
+   Done in 32-bit arithmetic so the loop vectorises: with v0 = 256 * bh + bl
+   and a = 256 * ah + al (0 <= bl, al < 256), (v0 + cl * a) >> 8 is
+   bh + cl * ah + ((bl + cl * al) >> 8), and only its low 32 bits are kept.
+   Rounding toward zero adds 255 first where the sum is negative; the sum
+   is linear in cl, so its two ends decide, and a span that changes sign
+   (rare: depth planes are positive) takes the plain 64-bit loop. */
+static void
+span_values(int64_t v0, int64_t a, int round, int32_t *restrict out)
+{
+    uint32_t bh = (uint32_t) (v0 >> 8), ah = (uint32_t) (a >> 8);
+    uint32_t bl = (uint32_t) (v0 & 255), al = (uint32_t) (a & 255);
+
+    if (round) {
+        const int64_t v1 = v0 + (NUM_CELLS - 1) * a;
+        if ((v0 < 0) != (v1 < 0)) {
+            int64_t v = v0;
+            for (int cl = 0; cl < NUM_CELLS; cl++, v += a)
+                out[cl] = (int32_t) (uint32_t) ((v + ((v >> 63) & 255)) >> 8);
+            return;
+        }
+        if (v0 < 0)
+            bl += 255;
+    }
+    for (int cl = 0; cl < NUM_CELLS; cl++, bh += ah, bl += al)
+        out[cl] = (int32_t) (bh + (bl >> 8));
+}
+
 /* One plane through the 32 cells. Masks are 0 or -1. */
 static void
 cells_process(cells_t *restrict s, const cell_control *in, const int32_t *restrict C, uint32_t index)
@@ -1712,16 +1744,12 @@ pcxr_render_tiles(pcxr_job_t *job, uint32_t *rgb, uint32_t first, uint32_t step)
                             }
                             if (dead) {
                                 if (!(i_empty && e->commit)) {
-                                    int64_t v = pl->a * xspan + pl->b * yline + (int64_t) pl->c * 256;
-                                    for (int cl = 0; cl < NUM_CELLS; cl++, v += pl->a)
-                                        depth[cl] = (int32_t) (uint32_t) ((v + ((v >> 63) & 255)) >> 8);
+                                    span_values(pl->a * xspan + pl->b * yline + (int64_t) pl->c * 256, pl->a, 1, depth);
                                     cells_process(&cells, &e->wi, depth, pl->index);
-                                    v = dead->a * xspan + dead->b * yline + (int64_t) dead->c * 256;
-                                    for (int cl = 0; cl < NUM_CELLS; cl++, v += dead->a) {
-                                        cells.I_depth[cl] = (int32_t) (uint32_t) ((v + ((v >> 63) & 255)) >> 8);
-                                        cells.I_visib[cl] = 0;
-                                        cells.I_id[cl]    = 0;
-                                    }
+                                    span_values(dead->a * xspan + dead->b * yline + (int64_t) dead->c * 256, dead->a, 1,
+                                                cells.I_depth);
+                                    memset(cells.I_visib, 0, sizeof(cells.I_visib));
+                                    memset(cells.I_id, 0, sizeof(cells.I_id));
                                     i_empty = 1;
                                 }
                                 k += pl->n_edges;
@@ -1732,7 +1760,6 @@ pcxr_render_tiles(pcxr_job_t *job, uint32_t *rgb, uint32_t first, uint32_t step)
                         if (e->run) {
                             /* 40-bit adder: the comparator sees the top 32 bits. */
                             int64_t creg = pl->a * xspan + pl->b * yline + (int64_t) pl->c * 256;
-                            int64_t v    = creg;
                             if (e->edge) {
                                 /* An edge plane that is inside (>= 0) on all
                                    32 cells changes nothing; the values are
@@ -1746,8 +1773,9 @@ pcxr_render_tiles(pcxr_job_t *job, uint32_t *rgb, uint32_t first, uint32_t step)
                                 const int32_t pv  = e->wi.plane_visib;
                                 if (creg >= 0 && end >= 0 && creg < ((int64_t) 1 << 39) && end < ((int64_t) 1 << 39))
                                     goto next_plane;
-                                for (int cl = 0; cl < NUM_CELLS; cl++, v += pl->a) {
-                                    const int32_t d = (int32_t) (uint32_t) (v >> 8);
+                                span_values(creg, pl->a, 0, depth);
+                                for (int cl = 0; cl < NUM_CELLS; cl++) {
+                                    const int32_t d = depth[cl];
                                     const int32_t m = d >> 31;
                                     cells.I_visib[cl]   = (pv & m) | (cells.I_visib[cl] & ~m);
                                     cells.I_forward[cl] = (1 & m) | (cells.I_forward[cl] & ~m);
@@ -1756,14 +1784,9 @@ pcxr_render_tiles(pcxr_job_t *job, uint32_t *rgb, uint32_t first, uint32_t step)
                                 }
                                 goto next_plane;
                             }
-                            if (e->wi.plane_perp) {
-                                for (int cl = 0; cl < NUM_CELLS; cl++, v += pl->a)
-                                    depth[cl] = (int32_t) (uint32_t) (v >> 8);
-                            } else {
-                                /* v / 256, rounding toward zero like the simulator */
-                                for (int cl = 0; cl < NUM_CELLS; cl++, v += pl->a)
-                                    depth[cl] = (int32_t) (uint32_t) ((v + ((v >> 63) & 255)) >> 8);
-                            }
+                            /* perpendicular planes: v >> 8; depth planes: v / 256,
+                               rounding toward zero like the simulator */
+                            span_values(creg, pl->a, !e->wi.plane_perp, depth);
                             cells_process(&cells, &e->wi, depth, pl->index);
                             i_empty = 0;
                         }
