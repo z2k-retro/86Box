@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 #include "vid_powervr_pcx_render.h"
 
 static inline int
@@ -524,6 +525,43 @@ level_addr_row(const level_t *l, int32_t u, int32_t row)
     return l->base + twid(u >> l->which, row);
 }
 
+/* level_addr() split by coordinate: the twiddled u and v parts of a
+   sample's offset (u bits at odd positions, v bits at even ones), so the
+   four samples of a bilinear lookup need two of each. */
+PCXR_INLINE uint32_t
+level_su(const level_t *l, int32_t u)
+{
+    if (l->flip_u && (u & l->fbit))
+        u = ~u;
+    u &= l->mask;
+    if (!l->mip)
+        return (uint32_t) spread8[(l->cdepth ? u : u >> 1) & 0xff] << 1;
+    if (l->last)
+        return 0;
+    return (uint32_t) spread8[(u >> l->which) & 0xff] << 1;
+}
+
+PCXR_INLINE uint32_t
+level_sv(const level_t *l, int32_t v)
+{
+    if (l->flip_v && (v & l->fbit))
+        v = ~v;
+    v &= l->mask;
+    if (l->mip && l->last)
+        return 0;
+    return spread8[(l->mip ? v >> l->which : v) & 0xff];
+}
+
+/* The same for a row the caller has already chosen (and mirrored), in this
+   level's texels. */
+PCXR_INLINE uint32_t
+level_sr(const level_t *l, int32_t row)
+{
+    if (l->mip && l->last)
+        return 0;
+    return spread8[row & 0xff];
+}
+
 /* The two texture rows the bilinear filter blends for row v of a texture
    mirrored in v (fbit: the bit that selects the mirrored half; mask: the
    texture's last row). Returns 1 if the weight is inverted.
@@ -727,25 +765,23 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
         } else {
             uf &= 31;
             vf &= 31;
-            if (lv0.flip_v) {
-                int32_t r0, r1;
-                if (vmir_rows(v, lv0.fbit, lv0.mask, &r0, &r1))
-                    vf = ~vf & 31;
-                tcol = colour_convert(fetch_pixel(c, level_addr_row(&lv0, u, r0)),
-                                      colour_depth, u & 1, col4444);
-                u1   = colour_convert(fetch_pixel(c, level_addr_row(&lv0, (u + 1) & 255, r0)),
-                                      colour_depth, (u + 1) & 1, col4444);
-                v1   = colour_convert(fetch_pixel(c, level_addr_row(&lv0, u, r1)),
-                                      colour_depth, u & 1, col4444);
-                u1v1 = colour_convert(fetch_pixel(c, level_addr_row(&lv0, (u + 1) & 255, r1)),
-                                      colour_depth, (u + 1) & 1, col4444);
-            } else {
-                u1   = colour_convert(fetch_pixel(c, level_addr(&lv0, (u + 1) & 255, v)),
-                                      colour_depth, (u + 1) & 1, col4444);
-                v1   = colour_convert(fetch_pixel(c, level_addr(&lv0, u, (v + 1) & 255)),
-                                      colour_depth, u & 1, col4444);
-                u1v1 = colour_convert(fetch_pixel(c, level_addr(&lv0, (u + 1) & 255, (v + 1) & 255)),
-                                      colour_depth, (u + 1) & 1, col4444);
+            {
+                const uint32_t su0 = level_su(&lv0, u), su1 = level_su(&lv0, (u + 1) & 255);
+                uint32_t       sv0, sv1;
+                if (lv0.flip_v) {
+                    int32_t r0, r1;
+                    if (vmir_rows(v, lv0.fbit, lv0.mask, &r0, &r1))
+                        vf = ~vf & 31;
+                    sv0  = level_sr(&lv0, r0);
+                    sv1  = level_sr(&lv0, r1);
+                    tcol = colour_convert(fetch_pixel(c, lv0.base + (su0 | sv0)), colour_depth, u & 1, col4444);
+                } else {
+                    sv0 = level_sv(&lv0, v);
+                    sv1 = level_sv(&lv0, (v + 1) & 255);
+                }
+                u1   = colour_convert(fetch_pixel(c, lv0.base + (su1 | sv0)), colour_depth, (u + 1) & 1, col4444);
+                v1   = colour_convert(fetch_pixel(c, lv0.base + (su0 | sv1)), colour_depth, u & 1, col4444);
+                u1v1 = colour_convert(fetch_pixel(c, lv0.base + (su1 | sv1)), colour_depth, (u + 1) & 1, col4444);
             }
             tcol = bilerp(tcol, u1, v1, u1v1, uf, vf);
         }
@@ -783,26 +819,24 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
         {
             uf = (uf >> compress) & 31;
             vf = (vf >> compress) & 31;
-            if (lvc.flip_v) {
-                /* The same, in this level's texels. */
-                int32_t r0, r1;
-                if (vmir_rows(v >> compress, lvc.fbit >> compress, lvc.mask >> compress, &r0, &r1))
-                    vf = ~vf & 31;
-                tcol = colour_convert(fetch_pixel(c, level_addr_row(&lvc, u, r0)),
-                                      colour_depth, u & 1, col4444);
-                u1   = colour_convert(fetch_pixel(c, level_addr_row(&lvc, (u + binc) & 255, r0)),
-                                      colour_depth, u & 1, col4444);
-                v1   = colour_convert(fetch_pixel(c, level_addr_row(&lvc, u, r1)),
-                                      colour_depth, u & 1, col4444);
-                u1v1 = colour_convert(fetch_pixel(c, level_addr_row(&lvc, (u + binc) & 255, r1)),
-                                      colour_depth, u & 1, col4444);
-            } else {
-                u1   = colour_convert(fetch_pixel(c, level_addr(&lvc, (u + binc) & 255, v)),
-                                      colour_depth, u & 1, col4444);
-                v1   = colour_convert(fetch_pixel(c, level_addr(&lvc, u, (v + binc) & 255)),
-                                      colour_depth, u & 1, col4444);
-                u1v1 = colour_convert(fetch_pixel(c, level_addr(&lvc, (u + binc) & 255, (v + binc) & 255)),
-                                      colour_depth, u & 1, col4444);
+            {
+                const uint32_t su0 = level_su(&lvc, u), su1 = level_su(&lvc, (u + binc) & 255);
+                uint32_t       sv0, sv1;
+                if (lvc.flip_v) {
+                    /* The same, in this level's texels. */
+                    int32_t r0, r1;
+                    if (vmir_rows(v >> compress, lvc.fbit >> compress, lvc.mask >> compress, &r0, &r1))
+                        vf = ~vf & 31;
+                    sv0  = level_sr(&lvc, r0);
+                    sv1  = level_sr(&lvc, r1);
+                    tcol = colour_convert(fetch_pixel(c, lvc.base + (su0 | sv0)), colour_depth, u & 1, col4444);
+                } else {
+                    sv0 = level_sv(&lvc, v);
+                    sv1 = level_sv(&lvc, (v + binc) & 255);
+                }
+                u1   = colour_convert(fetch_pixel(c, lvc.base + (su1 | sv0)), colour_depth, u & 1, col4444);
+                v1   = colour_convert(fetch_pixel(c, lvc.base + (su0 | sv1)), colour_depth, u & 1, col4444);
+                u1v1 = colour_convert(fetch_pixel(c, lvc.base + (su1 | sv1)), colour_depth, u & 1, col4444);
             }
             tcol = bilerp(tcol, u1, v1, u1v1, uf, vf);
         }
@@ -1115,6 +1149,7 @@ struct pcxr_job {
     object_t           *objects;
     tile_t             *tiles;
     uint32_t            n_planes, n_objects, n_tiles;
+    atomic_uint         next_tile; /* for step 0: the next tile to claim */
     uint32_t            cap_planes, cap_objects, cap_tiles;
 };
 
@@ -1383,6 +1418,7 @@ pcxr_prepare(pcxr_job_t *job, const pcxr_frame_t *f, pcxr_result_t *res)
     job->n_planes  = 0;
     job->n_objects = 0;
     job->n_tiles   = 0;
+    atomic_store(&job->next_tile, 0);
 
     start = (f->object_offset & ~3u) >> 2;
 
@@ -1659,7 +1695,9 @@ build_schedule(ctx_t *c, const pcxr_job_t *job, const tile_t *t, uint32_t p0, ui
 }
 
 /* Draw tiles first, first + step, first + 2 * step, ... Tiles cover
-   separate pixels, so several threads can do this at once. */
+   separate pixels, so several threads can do this at once. With step 0,
+   each thread instead claims the next undrawn tile until none are left, so
+   a thread the host runs late (or not at all) holds nobody up. */
 uint32_t
 pcxr_render_tiles(pcxr_job_t *job, uint32_t *rgb, uint32_t first, uint32_t step)
 {
@@ -1686,7 +1724,8 @@ pcxr_render_tiles(pcxr_job_t *job, uint32_t *rgb, uint32_t first, uint32_t step)
     c.tex_mask = (f->tex_words && !(f->tex_words & (f->tex_words - 1))) ? f->tex_words - 1 : 0;
     c.tsp_addr = 0xffffffffu;
 
-    for (uint32_t ti = first; ti < job->n_tiles; ti += step) {
+    for (uint32_t ti = step ? first : atomic_fetch_add(&job->next_tile, 1); ti < job->n_tiles;
+         ti = step ? ti + step : atomic_fetch_add(&job->next_tile, 1)) {
         const tile_t *t  = &job->tiles[ti];
         uint32_t      p0 = t->n_objects ? job->objects[t->first_object].first : 0;
         uint32_t      np = t->n_objects ? job->objects[t->first_object + t->n_objects - 1].first

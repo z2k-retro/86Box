@@ -53,8 +53,10 @@ typedef struct pcxr_result_t {
 } pcxr_result_t;
 
 /* Multi-threaded use: pcxr_prepare() once (in order), then
-   pcxr_render_tiles(job, rgb, i, n) from n threads with i = 0..n-1. The
-   frame and its memory must stay unchanged until all have returned. */
+   pcxr_render_tiles(job, rgb, i, n) from n threads with i = 0..n-1, or
+   pcxr_render_tiles(job, rgb, 0, 0) from any number of threads, which share
+   the tiles out as they go. The frame and its memory must stay unchanged
+   until all have returned. */
 typedef struct pcxr_job pcxr_job_t;
 pcxr_job_t *pcxr_job_create(void);
 void        pcxr_job_destroy(pcxr_job_t *job);

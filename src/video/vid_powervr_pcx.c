@@ -235,6 +235,7 @@ typedef struct pcx_t {
         int           index;
         thread_t     *thread;
         event_t      *go, *done;
+        double        start_ms, work_ms; /* this frame's tile phase */
     } helper[PCX_MAX_HELPERS];
     pcxr_job_t    *rjob;
     volatile int   render_quit;
@@ -249,6 +250,7 @@ typedef struct pcx_t {
     pcxr_result_t  job_res;
     uint32_t       job_sofaddr, job_stride, job_packmode;
     double         job_start_ms, job_ms; /* host time spent on the frame (render thread) */
+    double         job_cpu_ms, job_lag_ms; /* tile phase: thread time in total, latest helper start */
     /* Output prepared by the render thread: the frame packed to PACKMODE,
        and the runs of written pixels to bus-master to SOFADDR. */
     uint8_t       *out_buf; /* row y's bytes start at y * PCXR_MAX_W * 4 */
@@ -274,7 +276,7 @@ typedef struct pcx_t {
     int      dump_object_kb;
 
     /* Statistics. */
-    double   stat_render_ms, stat_render_max_ms, stat_wait_ms, stat_output_ms, stat_late_ms;
+    double   stat_render_ms, stat_render_max_ms, stat_wait_ms, stat_output_ms, stat_late_ms, stat_cpu_ms, stat_lag_ms;
     uint32_t stat_frames;
     uint32_t frames;
     uint32_t dumps;
@@ -491,9 +493,11 @@ pcx_render_helper(void *priv)
         thread_reset_event(h->go);
         if (pcx->render_quit)
             break;
-        if (pcx->phase == PCX_PHASE_TILES)
-            pcxr_render_tiles(pcx->rjob, pcx->rgb, h->index, pcx->n_helpers + 1);
-        else
+        if (pcx->phase == PCX_PHASE_TILES) {
+            h->start_ms = pcx_now_ms();
+            pcxr_render_tiles(pcx->rjob, pcx->rgb, 0, 0);
+            h->work_ms = pcx_now_ms() - h->start_ms;
+        } else
             pcx_pack_rows(pcx, h->index, pcx->n_helpers + 1);
         thread_set_event(h->done);
     }
@@ -576,16 +580,27 @@ pcx_pack_rows(pcx_t *pcx, int first, int step)
 static void
 pcx_run_phase(pcx_t *pcx, int phase)
 {
+    double t0 = pcx_now_ms();
+
     pcx->phase = phase;
     for (int i = 0; i < pcx->n_helpers; i++)
         thread_set_event(pcx->helper[i].go);
-    if (phase == PCX_PHASE_TILES)
-        pcxr_render_tiles(pcx->rjob, pcx->rgb, 0, pcx->n_helpers + 1);
-    else
+    if (phase == PCX_PHASE_TILES) {
+        /* The tiles are shared out as the threads ask for them, so a
+           helper the host starts late does not hold the frame up. */
+        pcxr_render_tiles(pcx->rjob, pcx->rgb, 0, 0);
+        pcx->job_cpu_ms += pcx_now_ms() - t0;
+    } else
         pcx_pack_rows(pcx, 0, pcx->n_helpers + 1);
     for (int i = 0; i < pcx->n_helpers; i++) {
         thread_wait_event(pcx->helper[i].done, -1);
         thread_reset_event(pcx->helper[i].done);
+        if (phase == PCX_PHASE_TILES) {
+            double lag = pcx->helper[i].start_ms - t0;
+            pcx->job_cpu_ms += pcx->helper[i].work_ms;
+            if (lag > pcx->job_lag_ms)
+                pcx->job_lag_ms = lag;
+        }
     }
 }
 
@@ -603,6 +618,7 @@ pcx_render_thread(void *priv)
             break;
         }
         pcx->job_start_ms = pcx_now_ms();
+        pcx->job_cpu_ms = pcx->job_lag_ms = 0.0;
         memset(pcx->rgb, 0, PCXR_MAX_W * PCXR_MAX_H * sizeof(uint32_t));
         if (pcxr_prepare(pcx->rjob, &pcx->job, &pcx->job_res) > 0)
             pcx_run_phase(pcx, PCX_PHASE_TILES);
@@ -735,18 +751,23 @@ pcx_render_done(void *priv)
         pcx->stat_output_ms += pcx_now_ms() - t1;
         pcx->stat_late_ms += pcx->render_late_us / 1000.0;
         pcx->stat_render_ms += pcx->job_ms;
+        pcx->stat_cpu_ms += pcx->job_cpu_ms;
+        pcx->stat_lag_ms += pcx->job_lag_ms;
         if (pcx->job_ms > pcx->stat_render_max_ms)
             pcx->stat_render_max_ms = pcx->job_ms;
         if (++pcx->stat_frames == 100) {
             pcx_log(pcx, PCX_LOG_SUMMARY,
                     "PowerVR: frames %u-%u: render %.1f ms average (%.1f max) on %d thread(s), "
                     "emulation waited %.1f ms and wrote output %.2f ms per frame; "
-                    "emulated render time %.1f ms + %.1f ms held back for the host\n",
+                    "emulated render time %.1f ms + %.1f ms held back for the host; "
+                    "tiles took %.1f ms of thread time, helpers started %.1f ms late\n",
                     pcx->frames - 99, pcx->frames, pcx->stat_render_ms / 100.0, pcx->stat_render_max_ms,
                     pcx->n_helpers + 1, pcx->stat_wait_ms / 100.0, pcx->stat_output_ms / 100.0,
-                    pcx->render_delay_us / 1000.0, pcx->stat_late_ms / 100.0);
+                    pcx->render_delay_us / 1000.0, pcx->stat_late_ms / 100.0, pcx->stat_cpu_ms / 100.0,
+                    pcx->stat_lag_ms / 100.0);
             pcx->stat_frames = 0;
             pcx->stat_render_ms = pcx->stat_render_max_ms = pcx->stat_wait_ms = pcx->stat_output_ms = pcx->stat_late_ms = 0.0;
+            pcx->stat_cpu_ms = pcx->stat_lag_ms = 0.0;
         }
     }
     if (pcx->debug_tile && pcx_bus_master_enabled(pcx)) {
