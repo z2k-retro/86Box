@@ -510,21 +510,6 @@ level_addr(const level_t *l, int32_t u, int32_t v)
     return l->base + twid(u >> l->which, v >> l->which);
 }
 
-/* level_addr() with the row already chosen (and mirrored) by the caller,
-   in this level's texels. */
-PCXR_INLINE uint32_t
-level_addr_row(const level_t *l, int32_t u, int32_t row)
-{
-    if (l->flip_u && (u & l->fbit))
-        u = ~u;
-    u &= l->mask;
-    if (!l->mip)
-        return l->base + (l->cdepth ? twid(u, row) : twid(u >> 1, row));
-    if (l->last)
-        return l->base;
-    return l->base + twid(u >> l->which, row);
-}
-
 /* level_addr() split by coordinate: the twiddled u and v parts of a
    sample's offset (u bits at odd positions, v bits at even ones), so the
    four samples of a bilinear lookup need two of each. */
