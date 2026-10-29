@@ -177,6 +177,14 @@ typedef struct {
     int                 ta, tb, tc, td, te, tf, tp, tq, tr, texp, tmap_size, tcdepth, tmip, t4444, tgtrans, tflip;
     uint32_t            taddr;
     pfloat              tpmip;
+    /* The four texels of the last bilinear lookup, decoded, and where they
+       came from: neighbouring pixels of a magnified texture often blend
+       the same four. */
+    uint32_t            blk_key[6];
+    rgba_t              blk[4];
+    /* The same for single texels (two: linear mip-mapping reads two levels). */
+    uint32_t            px_key[2];
+    rgba_t              px[2];
 } ctx_t;
 
 /* ---- ISP (SABRE) ------------------------------------------------------ */
@@ -623,6 +631,46 @@ colour_convert(uint16_t raw, int colour_depth, int which_pixel, int translucent)
     return p;
 }
 
+/* One texel, decoded, from cache entry e when it was the last one read
+   there. */
+PCXR_INLINE rgba_t
+fetch_one(ctx_t *c, int e, uint32_t address, int colour_depth, int which, int col4444)
+{
+    const uint32_t key = (address << 1) | (uint32_t) which;
+    if (c->px_key[e] != key) {
+        c->px_key[e] = key;
+        c->px[e]     = colour_convert(fetch_pixel(c, address), colour_depth, which, col4444);
+    }
+    return c->px[e];
+}
+
+/* The four texels of a bilinear lookup, decoded, from the cache when the
+   previous lookup used the same ones. which: the texel's pixel half for
+   8-bit maps (the same for all four, as in the chip). */
+PCXR_INLINE void
+fetch_quad(ctx_t *c, uint32_t base, uint32_t su0, uint32_t su1, uint32_t sv0, uint32_t sv1, int colour_depth,
+           int which0, int which1, int col4444, rgba_t *q)
+{
+    const uint32_t key5 = (uint32_t) which0 | ((uint32_t) which1 << 1);
+    if (c->blk_key[0] != base || c->blk_key[1] != su0 || c->blk_key[2] != su1 || c->blk_key[3] != sv0
+        || c->blk_key[4] != sv1 || c->blk_key[5] != key5) {
+        c->blk_key[0] = base;
+        c->blk_key[1] = su0;
+        c->blk_key[2] = su1;
+        c->blk_key[3] = sv0;
+        c->blk_key[4] = sv1;
+        c->blk_key[5] = key5;
+        c->blk[0]     = colour_convert(fetch_pixel(c, base + (su0 | sv0)), colour_depth, which0, col4444);
+        c->blk[1]     = colour_convert(fetch_pixel(c, base + (su1 | sv0)), colour_depth, which1, col4444);
+        c->blk[2]     = colour_convert(fetch_pixel(c, base + (su0 | sv1)), colour_depth, which0, col4444);
+        c->blk[3]     = colour_convert(fetch_pixel(c, base + (su1 | sv1)), colour_depth, which1, col4444);
+    }
+    q[0] = c->blk[0];
+    q[1] = c->blk[1];
+    q[2] = c->blk[2];
+    q[3] = c->blk[3];
+}
+
 PCXR_INLINE rgba_t
 bilerp(rgba_t t, rgba_t u1, rgba_t v1, rgba_t u1v1, int32_t uf, int32_t vf)
 {
@@ -649,7 +697,7 @@ bilerp(rgba_t t, rgba_t u1, rgba_t v1, rgba_t u1v1, int32_t uf, int32_t vf)
 }
 
 PCXR_INLINE rgba_t
-texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, int f, int p, int q, int r,
+texture_pixel(ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, int f, int p, int q, int r,
               int exp, uint32_t address, int map_size, pfloat pmip, int colour_depth, int mip_mapped,
               int col4444, int global_trans, int flip_uv)
 {
@@ -741,9 +789,8 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
     if (bot.e < 1 || !mip_mapped || colour_depth == 0) {
         level_t lv0;
         level_init(&lv0, address, map_size, 0, colour_depth, mip_mapped, flip_uv);
-        tcol = colour_convert(fetch_pixel(c, level_addr(&lv0, u, v)),
-                              colour_depth, u & 1, col4444);
         if (!bilin) {
+            tcol   = fetch_one(c, 0, level_addr(&lv0, u, v), colour_depth, u & 1, col4444);
             tcol.r = (uint8_t) ((tcol.r << 3) + 4);
             tcol.g = (uint8_t) ((tcol.g << 3) + 4);
             tcol.b = (uint8_t) ((tcol.b << 3) + 4);
@@ -753,20 +800,22 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
             {
                 const uint32_t su0 = level_su(&lv0, u), su1 = level_su(&lv0, (u + 1) & 255);
                 uint32_t       sv0, sv1;
+                rgba_t         q[4];
                 if (lv0.flip_v) {
                     int32_t r0, r1;
                     if (vmir_rows(v, lv0.fbit, lv0.mask, &r0, &r1))
                         vf = ~vf & 31;
-                    sv0  = level_sr(&lv0, r0);
-                    sv1  = level_sr(&lv0, r1);
-                    tcol = colour_convert(fetch_pixel(c, lv0.base + (su0 | sv0)), colour_depth, u & 1, col4444);
+                    sv0 = level_sr(&lv0, r0);
+                    sv1 = level_sr(&lv0, r1);
                 } else {
                     sv0 = level_sv(&lv0, v);
                     sv1 = level_sv(&lv0, (v + 1) & 255);
                 }
-                u1   = colour_convert(fetch_pixel(c, lv0.base + (su1 | sv0)), colour_depth, (u + 1) & 1, col4444);
-                v1   = colour_convert(fetch_pixel(c, lv0.base + (su0 | sv1)), colour_depth, u & 1, col4444);
-                u1v1 = colour_convert(fetch_pixel(c, lv0.base + (su1 | sv1)), colour_depth, (u + 1) & 1, col4444);
+                fetch_quad(c, lv0.base, su0, su1, sv0, sv1, colour_depth, u & 1, (u + 1) & 1, col4444, q);
+                tcol = q[0];
+                u1   = q[1];
+                v1   = q[2];
+                u1v1 = q[3];
             }
             tcol = bilerp(tcol, u1, v1, u1v1, uf, vf);
         }
@@ -788,10 +837,8 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
             rgba_t  hi, lo;
             int     t;
             level_init(&lve, address, map_size, bot.e, colour_depth, mip_mapped, flip_uv);
-            hi = colour_convert(fetch_pixel(c, level_addr(&lvc, u, v)),
-                                       colour_depth, 0, col4444);
-            lo = colour_convert(fetch_pixel(c, level_addr(&lve, u, v)),
-                                colour_depth, 0, col4444);
+            hi = fetch_one(c, 0, level_addr(&lvc, u, v), colour_depth, 0, col4444);
+            lo = fetch_one(c, 1, level_addr(&lve, u, v), colour_depth, 0, col4444);
             t  = (bot.m & 0x7f) >> 2;
             tcol.r    = (uint8_t) ((hi.r << 3) + ((t * ((int) lo.r - hi.r)) >> 2) + 4);
             tcol.g    = (uint8_t) ((hi.g << 3) + ((t * ((int) lo.g - hi.g)) >> 2) + 4);
@@ -799,29 +846,29 @@ texture_pixel(const ctx_t *c, int x, int y, int a, int b, int cc, int d, int e, 
             tcol.a    = lo.a;
             goto done;
         }
-        tcol = colour_convert(fetch_pixel(c, level_addr(&lvc, u, v)),
-                              colour_depth, u & 1, col4444);
         {
             uf = (uf >> compress) & 31;
             vf = (vf >> compress) & 31;
             {
                 const uint32_t su0 = level_su(&lvc, u), su1 = level_su(&lvc, (u + binc) & 255);
                 uint32_t       sv0, sv1;
+                rgba_t         q[4];
                 if (lvc.flip_v) {
                     /* The same, in this level's texels. */
                     int32_t r0, r1;
                     if (vmir_rows(v >> compress, lvc.fbit >> compress, lvc.mask >> compress, &r0, &r1))
                         vf = ~vf & 31;
-                    sv0  = level_sr(&lvc, r0);
-                    sv1  = level_sr(&lvc, r1);
-                    tcol = colour_convert(fetch_pixel(c, lvc.base + (su0 | sv0)), colour_depth, u & 1, col4444);
+                    sv0 = level_sr(&lvc, r0);
+                    sv1 = level_sr(&lvc, r1);
                 } else {
                     sv0 = level_sv(&lvc, v);
                     sv1 = level_sv(&lvc, (v + binc) & 255);
                 }
-                u1   = colour_convert(fetch_pixel(c, lvc.base + (su1 | sv0)), colour_depth, u & 1, col4444);
-                v1   = colour_convert(fetch_pixel(c, lvc.base + (su0 | sv1)), colour_depth, u & 1, col4444);
-                u1v1 = colour_convert(fetch_pixel(c, lvc.base + (su1 | sv1)), colour_depth, u & 1, col4444);
+                fetch_quad(c, lvc.base, su0, su1, sv0, sv1, colour_depth, u & 1, u & 1, col4444, q);
+                tcol = q[0];
+                u1   = q[1];
+                v1   = q[2];
+                u1v1 = q[3];
             }
             tcol = bilerp(tcol, u1, v1, u1v1, uf, vf);
         }
@@ -881,6 +928,8 @@ texas(ctx_t *c, int x, int y, uint32_t address, int shadow, int fog)
         for (int i = 0; i < 13; i++)
             c->tsp[i] = tsp_word(c, address + i);
         c->tsp_addr = address;
+        c->blk_key[0] = 0xffffffffu; /* other parameters, possibly another format */
+        c->px_key[0] = c->px_key[1] = 0xffffffffu;
         if (c->tsp[0] & MASK_TEXTURE) {
             uint32_t w2 = TSPW(2), w3 = TSPW(3), w4 = TSPW(4), w5 = TSPW(5), w6 = TSPW(6), w7 = TSPW(7);
             c->tpmip.m   = (int32_t) ((w2 & MASK_PMIP_M) >> SHIFT_PMIP_M);
