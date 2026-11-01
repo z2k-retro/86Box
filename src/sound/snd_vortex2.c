@@ -653,10 +653,10 @@ static const device_config_t vortex2_config[] = {
     },
     {
         .name           = "log",
-        .description    = "Diagnostic log (status every 2 s, stream events)",
+        .description    = "Write diagnostic log (vortex2.log in the machine folder)",
         .type           = CONFIG_BINARY,
         .default_string = NULL,
-        .default_int    = 1,
+        .default_int    = 0,
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = { { 0 } },
