@@ -10,6 +10,7 @@ on:
     branches:
       - powervr-pcx
       - pcx-perf
+      - vortex2
     tags:
       - 'pcx-*'
   release:

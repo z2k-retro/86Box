@@ -1,0 +1,1635 @@
+/*
+ * 86Box    A hypervisor and IBM PC system emulator that specializes in
+ *          running old operating systems and software designed for IBM
+ *          PC systems and compatibles from 1981 through fairly recent
+ *          system designs based on the PCI bus.
+ *
+ *          This file is part of the 86Box distribution.
+ *
+ *          Aureal Vortex 2 (AU8830) chip model.
+ *
+ *          Everything here was established by tracing a real SQ2500
+ *          under the stock Windows 98 driver (4.06.2048): every register
+ *          access logged through QEMU/VFIO with the card's line output
+ *          recorded alongside, plus host-side register pokes. Register
+ *          names follow the Linux ALSA au88x0 driver. Where a behaviour
+ *          is a working hypothesis rather than a measurement, the comment
+ *          says so.
+ *
+ *          Signal flow. The chip moves samples over an internal "ADB" bus
+ *          according to a route table: each route copies one source
+ *          address (DMA channel, sample-rate converter output, mixer
+ *          output, wavetable output, A3D output, crosstalk canceller or EQ
+ *          output, codec input) to one sink address (converter input,
+ *          mixer input, A3D input, canceller input, EQ input, codec
+ *          output, capture DMA). The model runs the whole graph at 48 kHz
+ *          in blocks of V2_BLOCK frames, evaluating each source on demand;
+ *          a feedback loop in the graph gets the previous block's values.
+ *
+ * Authors: Zvi Rosen and contributors.
+ *
+ *          Copyright 2026 Zvi Rosen.
+ */
+#include <math.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "snd_vortex2_core.h"
+#include "snd_vortex2_tables.h"
+
+#define B V2_BLOCK
+
+/* ------------------------------------------------------------------ */
+/* Register map                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Wavetable: two banks of 32 voices, 0x8000 apart. */
+#define WT_BANK_STRIDE 0x8000
+#define WT_DSREG       0x0008 /* direct-stream bits, one per voice */
+#define WT_STEREO      0x0080 /* + (voice / 2) * 4 */
+#define WT_RUN         0x0180 /* + voice * 4 */
+#define WT_PARM        0x0200 /* + voice * 0x10 + n * 4 */
+
+#define FIFO_WTCTRL    0x16000 /* + channel * 4, 64 channels */
+#define FIFO_ADBCTRL   0x16100 /* + channel * 4, 32 channels */
+#define FIFO_VALID     0x00000010
+#define FIFO_EMPTY     0x00000020
+#define FIFO_U1        0x00040000
+
+#define A3D_BASE       0x18000
+#define A3D_END        0x20000
+
+#define MIX_INVOL_B    0x20000 /* current: + ((mix << 5) + in) * 4 */
+#define MIX_VOL_B      0x20800 /* current: + mix * 4 */
+#define MIX_INVOL_A    0x21000 /* target */
+#define MIX_VOL_A      0x21800 /* target */
+#define MIX_ENIN       0x21a00 /* + ((mix << 3) + (in >> 2)) * 4, bit in & 3 */
+
+#define XT_BASE        0x24000
+#define XT_END         0x24680
+#define XT_GAIN_EQL    0x24538
+#define XT_GAIN_EQR    0x24540
+#define XT_GAIN_XTL    0x24548
+#define XT_GAIN_XTR    0x24550
+#define XT_CTRL        0x24660
+
+#define SRC_CONVRATIO  0x26e40 /* + src * 4, Q14 input rate / 48 kHz */
+
+#define WTDMA_BUFBASE  0x27000
+#define WTDMA_BUFCFG   0x27600
+#define WTDMA_CTRL     0x27900
+#define WTDMA_START    0x27b00
+#define WTDMA_STAT     0x27d00
+#define ADBDMA_BUFBASE 0x27400
+#define ADBDMA_BUFCFG  0x27800
+#define ADBDMA_CTRL    0x27a00
+#define ADBDMA_START   0x27c00
+#define ADBDMA_STAT    0x27e00
+#define WTDMA_PAGES    0x27a80 /* 4 words, 2 bits per channel, MSB first */
+#define ADBDMA_PAGES   0x27a90 /* 2 words */
+
+#define ADB_RTBASE     0x28000
+#define ADB_CHNBASE    0x282b4
+#define ADB_NCHN       24
+#define ADB_SR         0x28400
+
+#define CODEC_CTRL     0x29184
+#define CODEC_IO       0x29188
+#define SMP_TIME       0x29198
+#define SMP_TIMER      0x2919c
+
+#define IRQ_SOURCE     0x2a000
+#define IRQ_CTRL       0x2a004
+#define IRQ_STAT       0x2a008
+#define CHIP_CTRL      0x2a00c
+#define CTRL_IRQ_EN    0x00004000
+
+#define IRQ_PCMOUT     0x00000020 /* DMA page completed (interrupt-enabled channel) */
+#define IRQ_TIMER      0x00001000
+#define IRQ_ALWAYS     0x00004000 /* set in every read during operation; meaning unknown */
+
+#define EQ_BASE        0x2b000
+#define EQ_END         0x2b450
+#define EQ_BYPASS_L    0x2b3d4
+#define EQ_BYPASS_R    0x2b3ec
+
+#define DECODE_END     0x2c000 /* above: not decoded, reads return the last bus value */
+
+/* ADB source addresses */
+#define AS_SRCOUT  0x20
+#define AS_MIXOUT  0x30
+#define AS_WT0     0x40
+#define AS_XTOUT   0x66
+#define AS_EQOUT   0x7e
+#define AS_WT1     0x80
+#define AS_A3DOUT  0xa6
+/* ADB sink addresses */
+#define AK_DMAB    0x20
+#define AK_SRCIN   0x40
+#define AK_MIXIN   0x50
+#define AK_A3DIN   0x70
+#define AK_CODEC   0x88
+#define AK_XTIN    0x96
+#define AK_EQIN    0xa0
+
+#define NR_ADBDMA  32
+#define NR_WTDMA   64
+#define NR_SRC     16
+#define NR_MIXIN   32
+#define NR_MIXOUT  16
+#define NR_A3D     16
+#define MAX_ROUTES 256
+#define MAX_PER_SINK 8
+
+#define HRTF_TAPS  56
+#define ITD_LEN    128 /* delay line, power of two */
+#define FIFO_LEN   512
+
+/* ------------------------------------------------------------------ */
+/* State                                                               */
+/* ------------------------------------------------------------------ */
+
+enum { DMA_IDLE = 0, DMA_RUN, DMA_STALL, DMA_END };
+
+typedef struct v2_dma_t {
+    uint8_t  is_wt;
+    uint8_t  ch;
+    uint8_t  state;
+    uint8_t  page;
+    uint8_t  touched; /* driver has started it since reset */
+    uint32_t pos;     /* byte offset in the current page */
+    uint8_t  fifo[FIFO_LEN];
+    uint32_t frd, fn;
+    float    frame[4]; /* last frame fetched, shared by the routes reading it */
+    uint32_t frame_no;
+    uint32_t rate_acc; /* capture: phase accumulator (16.16) */
+} v2_dma_t;
+
+typedef struct v2_route_t {
+    uint8_t  src, sink, idx;
+    uint32_t cnt; /* frames this route has taken from a DMA source */
+} v2_route_t;
+
+typedef struct v2_src_t {
+    double   phase;
+    float    hist[4];
+    uint32_t nin;
+} v2_src_t;
+
+typedef struct v2_wtv_t {
+    double   phase;
+    float    hist[4];
+    float    lp;
+    uint32_t nin;
+} v2_wtv_t;
+
+typedef struct v2_a3d_t {
+    int   loaded;
+    float h[2][HRTF_TAPS]; /* current taps, [ear][tap], ear 0 = left */
+    float gain;
+    float co[5]; /* a1, a2, b0, b1, b2 */
+    float itd[2];
+    float x1, x2, y1, y2;
+    float dl[2][ITD_LEN];
+    int   dlpos;
+    float fh[2][HRTF_TAPS - 1 + B]; /* FIR history */
+    int   active;
+} v2_a3d_t;
+
+typedef struct { float re, im; } cpx;
+
+#define XT_N    64             /* FFT size */
+#define XT_P    32             /* partitions of B taps */
+typedef struct v2_xt_t {
+    int   mode; /* 0 pass-through, 1 wide, 2 narrow */
+    float prev[2][B];
+    cpx   fdl[2][XT_P][XT_N];
+    int   head;
+} v2_xt_t;
+
+typedef struct v2_eq_t {
+    float co[2][10][5];
+    float st[2][10][4];
+    float gain[2][10];
+    float bypass[2];
+} v2_eq_t;
+
+struct v2_chip_t {
+    v2_host_t host;
+    uint32_t  regs[V2_REG_SIZE / 4];
+    uint8_t   ro[V2_REG_SIZE / 4 / 8];
+    uint32_t  last_bus;
+
+    /* interrupts and timer */
+    uint32_t irq_src;
+    int      irq_level;
+    int      timer_fired;
+    uint32_t timer_last;
+    uint32_t timer_t0;
+
+    v2_dma_t adb[NR_ADBDMA];
+    v2_dma_t wt[NR_WTDMA];
+
+    /* routing graph */
+    int        graph_dirty;
+    v2_route_t route[MAX_ROUTES];
+    int        nroutes;
+    uint8_t    sink_n[256];
+    uint16_t   sink_r[256][MAX_PER_SINK];
+    uint8_t    dma_nroutes[NR_ADBDMA];
+
+    v2_src_t src[NR_SRC];
+    v2_wtv_t wtv[NR_WTDMA];
+    v2_a3d_t a3d[NR_A3D];
+    uint8_t  a3d_cur_dirty[NR_A3D];
+
+    int     xt_dirty;
+    v2_xt_t xt;
+    cpx     xt_h[2][2][XT_P][XT_N]; /* [mode-1][same/cross][partition][bin] */
+    cpx     tw[XT_N / 2];
+    int     rev[XT_N];
+
+    int     eq_dirty;
+    v2_eq_t eq;
+
+    /* per-block evaluation */
+    float   sbuf[256][B];
+    uint8_t sstate[256];
+    float   kbuf[256][B];
+    uint8_t kstate[256];
+    int     wt_done[2];
+    float   wt_direct[2][32][B];
+    float   wt_bus[2][6][B];
+    int     a3d_done, xt_done, eq_done;
+    float   a3d_out[8][B];
+    float   xt_out[2][B];
+    float   eq_out[2][B];
+
+    uint32_t dbg;
+};
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+#define R(a)  (c->regs[((a) & (V2_REG_SIZE - 1)) >> 2])
+#define LO16(w) ((int16_t) ((w) & 0xffff))
+#define HI16(w) ((int16_t) ((w) >> 16))
+
+static void
+v2_log(v2_chip_t *c, const char *fmt, ...)
+{
+    char    buf[256];
+    va_list ap;
+
+    if (!c->host.log)
+        return;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    c->host.log(c->host.priv, buf);
+}
+
+static inline float
+clampf(float v, float lo, float hi)
+{
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+
+/* Catmull-Rom interpolation between h[1] and h[2]. */
+static inline float
+interp4(const float *h, float t)
+{
+    float c1 = 0.5f * (h[2] - h[0]);
+    float c2 = h[0] - 2.5f * h[1] + 2.0f * h[2] - 0.5f * h[3];
+    float c3 = 0.5f * (h[3] - h[0]) + 1.5f * (h[1] - h[2]);
+    return ((c3 * t + c2) * t + c1) * t + h[1];
+}
+
+/* Mixer gain byte: 0x08 = unity, about 0.75 dB per step (signed), 0x80 =
+   mute. Measured on the input side through DirectSound volume; the
+   output side is assumed to follow the same law. */
+static float mix_gain_tab[256];
+
+static void
+init_tables(void)
+{
+    static int done = 0;
+
+    if (done)
+        return;
+    for (int b = 0; b < 256; b++) {
+        if (b == 0x80)
+            mix_gain_tab[b] = 0.0f;
+        else {
+            double db = ((double) (int8_t) b - 8.0) * 0.75;
+            if (db > 24.0)
+                db = 24.0;
+            mix_gain_tab[b] = (float) pow(10.0, db / 20.0);
+        }
+    }
+    done = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Interrupts                                                          */
+/* ------------------------------------------------------------------ */
+
+static void
+update_irq(v2_chip_t *c)
+{
+    int level = (R(CHIP_CTRL) & CTRL_IRQ_EN) && (c->irq_src & R(IRQ_CTRL));
+
+    if (level != c->irq_level) {
+        c->irq_level = level;
+        if (c->host.set_irq)
+            c->host.set_irq(c->host.priv, level);
+    }
+}
+
+static void
+raise_irq(v2_chip_t *c, uint32_t bits)
+{
+    c->irq_src |= bits;
+    update_irq(c);
+}
+
+void
+v2_timer_expired(v2_chip_t *c)
+{
+    c->timer_fired = 1;
+    raise_irq(c, IRQ_TIMER);
+}
+
+/* ------------------------------------------------------------------ */
+/* DMA engines                                                         */
+/*                                                                     */
+/* Each channel has four page addresses and two configuration words.   */
+/* Per page: a 12-bit size (bytes - 1) and a nibble:                   */
+/*   bit 3  page holds data                                            */
+/*   bit 2  carry on to the next page when this one is done            */
+/*   bits 1-0  next page                                               */
+/* (Decoded from the Windows driver's streaming patterns and its DOS   */
+/* Sound Blaster emulation, which plays one page and stops.) A page    */
+/* with no "carry on" ends the stream; carrying on to a page without   */
+/* data stalls until the driver marks it.                              */
+/* ------------------------------------------------------------------ */
+
+static inline uint32_t dma_base(const v2_dma_t *d) { return (d->is_wt ? WTDMA_BUFBASE : ADBDMA_BUFBASE) + d->ch * 0x10; }
+static inline uint32_t dma_cfg(const v2_dma_t *d) { return (d->is_wt ? WTDMA_BUFCFG : ADBDMA_BUFCFG) + d->ch * 8; }
+static inline uint32_t dma_ctrl(const v2_dma_t *d) { return (d->is_wt ? WTDMA_CTRL : ADBDMA_CTRL) + d->ch * 4; }
+static inline uint32_t dma_start(const v2_dma_t *d) { return (d->is_wt ? WTDMA_START : ADBDMA_START) + d->ch * 4; }
+static inline uint32_t dma_fifo(const v2_dma_t *d) { return (d->is_wt ? FIFO_WTCTRL : FIFO_ADBCTRL) + d->ch * 4; }
+
+static inline int
+dma_nibble(v2_chip_t *c, const v2_dma_t *d, int page)
+{
+    uint32_t w = R(dma_cfg(d) + ((page & 2) ? 4 : 0));
+    return (w >> ((page & 1) ? 24 : 28)) & 0xf;
+}
+
+static inline uint32_t
+dma_size(v2_chip_t *c, const v2_dma_t *d, int page)
+{
+    uint32_t w = R(dma_cfg(d) + ((page & 2) ? 4 : 0));
+    return ((w >> ((page & 1) ? 0 : 12)) & 0xfff) + 1;
+}
+
+static inline int
+dma_fmt(v2_chip_t *c, const v2_dma_t *d)
+{
+    return (R(dma_ctrl(d)) >> 14) & 0xf;
+}
+
+static inline int
+dma_bps(int fmt)
+{
+    return (fmt == 1 || fmt == 2 || fmt == 3) ? 1 : 2;
+}
+
+static void
+dma_enter_page(v2_chip_t *c, v2_dma_t *d, int page)
+{
+    d->page  = page & 3;
+    d->pos   = 0;
+    d->state = (dma_nibble(c, d, d->page) & 8) ? DMA_RUN : DMA_STALL;
+}
+
+static void
+dma_page_end(v2_chip_t *c, v2_dma_t *d)
+{
+    int nib = dma_nibble(c, d, d->page);
+
+    if (R(dma_ctrl(d)) & 0x1000)
+        raise_irq(c, IRQ_PCMOUT);
+    if (nib & 4)
+        dma_enter_page(c, d, nib & 3);
+    else {
+        d->state = DMA_END;
+        /* The card drops the FIFO's run bits when a stream ends (seen as
+           0x42070 -> 0x2680 in the DOS Sound Blaster trace). */
+        R(dma_fifo(d)) &= ~(FIFO_VALID | FIFO_U1);
+    }
+}
+
+static void
+dma_begin(v2_chip_t *c, v2_dma_t *d)
+{
+    int nib;
+
+    d->touched  = 1;
+    d->frd      = 0;
+    d->fn       = 0;
+    d->frame_no = 0;
+    d->rate_acc = 0;
+    memset(d->frame, 0, sizeof(d->frame));
+    d->page  = (R(dma_start(d)) >> ((15 - (d->ch & 15)) * 2)) & 3;
+    d->pos   = R(dma_ctrl(d)) & 0xfff;
+    d->state = DMA_RUN;
+    nib      = dma_nibble(c, d, d->page);
+    if (!(nib & 8)) {
+        /* Start page without data: treat it as already played. The
+           Windows wavetable path starts on such a page linked to the
+           first real one. */
+        if (nib & 4)
+            dma_enter_page(c, d, nib & 3);
+        else
+            d->state = DMA_STALL;
+    }
+}
+
+/* Pull bytes from guest memory into the FIFO until it holds `need`. */
+static void
+dma_fill(v2_chip_t *c, v2_dma_t *d, uint32_t need)
+{
+    uint8_t tmp[128];
+    int     guard = 8;
+
+    while (d->fn < need && guard-- > 0) {
+        if (d->state == DMA_STALL) {
+            if (dma_nibble(c, d, d->page) & 8)
+                d->state = DMA_RUN;
+            else
+                return;
+        }
+        if (d->state != DMA_RUN)
+            return;
+        uint32_t size = dma_size(c, d, d->page);
+        if (d->pos >= size) {
+            dma_page_end(c, d);
+            continue;
+        }
+        uint32_t n = size - d->pos;
+        if (n > sizeof(tmp))
+            n = sizeof(tmp);
+        if (n > FIFO_LEN - d->fn)
+            n = FIFO_LEN - d->fn;
+        if (n == 0)
+            return;
+        c->host.mem_read(c->host.priv, R(dma_base(d) + d->page * 4) + d->pos, tmp, n);
+        for (uint32_t i = 0; i < n; i++)
+            d->fifo[(d->frd + d->fn + i) & (FIFO_LEN - 1)] = tmp[i];
+        d->fn += n;
+        d->pos += n;
+        if (d->pos >= size)
+            dma_page_end(c, d);
+        guard = 8;
+    }
+}
+
+static inline uint8_t
+fifo_pop(v2_dma_t *d)
+{
+    uint8_t v = d->fifo[d->frd];
+    d->frd    = (d->frd + 1) & (FIFO_LEN - 1);
+    d->fn--;
+    return v;
+}
+
+static float
+ulaw_dec(uint8_t u)
+{
+    int t;
+    u = ~u;
+    t = ((u & 0x0f) << 3) + 0x84;
+    t <<= (u & 0x70) >> 4;
+    return (float) ((u & 0x80) ? (0x84 - t) : (t - 0x84)) / 32768.0f;
+}
+
+static float
+alaw_dec(uint8_t a)
+{
+    int t, seg;
+    a ^= 0x55;
+    t   = (a & 0x0f) << 4;
+    seg = (a & 0x70) >> 4;
+    if (seg == 0)
+        t += 8;
+    else if (seg == 1)
+        t += 0x108;
+    else
+        t = (t + 0x108) << (seg - 1);
+    return (float) ((a & 0x80) ? t : -t) / 32768.0f;
+}
+
+/* Fetch the next frame of nch samples from a playback channel. */
+static void
+dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
+{
+    int fmt = dma_fmt(c, d);
+    int bps = dma_bps(fmt);
+
+    if (nch < 1)
+        nch = 1;
+    if (nch > 4)
+        nch = 4;
+    if (d->fn < (uint32_t) (nch * bps))
+        dma_fill(c, d, 64);
+    if (d->fn < (uint32_t) (nch * bps)) {
+        for (int i = 0; i < 4; i++)
+            d->frame[i] = 0.0f; /* underrun */
+        d->frame_no++;
+        return;
+    }
+    for (int i = 0; i < nch; i++) {
+        float v;
+        if (fmt == 1)
+            v = ((float) fifo_pop(d) - 128.0f) / 128.0f;
+        else if (fmt == 2)
+            v = alaw_dec(fifo_pop(d));
+        else if (fmt == 3)
+            v = ulaw_dec(fifo_pop(d));
+        else {
+            uint8_t lo = fifo_pop(d);
+            uint8_t hi = fifo_pop(d);
+            v          = (float) (int16_t) (lo | (hi << 8)) / 32768.0f;
+        }
+        d->frame[i] = v;
+    }
+    d->frame_no++;
+}
+
+/* A consumer (route, converter, voice) takes sample idx of its next
+   frame; consumers reading the same channel in lockstep share frames. */
+static float
+dma_take(v2_chip_t *c, v2_dma_t *d, int idx, int nch, uint32_t *cnt)
+{
+    if (d->state == DMA_IDLE)
+        return 0.0f;
+    if (*cnt >= d->frame_no || *cnt + 1 < d->frame_no) {
+        if (*cnt + 1 < d->frame_no)
+            *cnt = d->frame_no; /* fell behind: resynchronise */
+        dma_next_frame(c, d, nch);
+    }
+    (*cnt)++;
+    return d->frame[idx & 3];
+}
+
+/* Capture: write one frame to guest memory. */
+static void
+dma_put_frame(v2_chip_t *c, v2_dma_t *d, const float *v, int nch)
+{
+    uint8_t buf[8];
+    int     fmt = dma_fmt(c, d);
+    int     bps = dma_bps(fmt);
+    int     n   = 0;
+
+    if (d->state == DMA_STALL && (dma_nibble(c, d, d->page) & 8))
+        d->state = DMA_RUN;
+    if (d->state != DMA_RUN)
+        return;
+    for (int i = 0; i < nch; i++) {
+        int s = (int) lrintf(clampf(v[i], -1.0f, 32767.0f / 32768.0f) * 32768.0f);
+        if (bps == 1)
+            buf[n++] = (uint8_t) ((s >> 8) + 128);
+        else {
+            buf[n++] = s & 0xff;
+            buf[n++] = (s >> 8) & 0xff;
+        }
+    }
+    uint32_t size = dma_size(c, d, d->page);
+    if (d->pos + n > size)
+        n = size - d->pos;
+    if (n > 0)
+        c->host.mem_write(c->host.priv, R(dma_base(d) + d->page * 4) + d->pos, buf, n);
+    d->pos += n;
+    if (d->pos >= size)
+        dma_page_end(c, d);
+}
+
+static uint32_t
+dma_stat(v2_chip_t *c, v2_dma_t *d)
+{
+    uint32_t v = ((uint32_t) d->page << 12) | (d->pos & 0xfff);
+
+    (void) c;
+    switch (d->state) {
+        case DMA_RUN:
+        case DMA_STALL:
+            return v | 0x00200000;
+        case DMA_END:
+            return v | 0x00040000; /* stream finished: neither run (0x200000) nor idle (0x500000) */
+        default:
+            return v | 0x00500000;
+    }
+}
+
+static uint32_t
+dma_pages_word(v2_chip_t *c, uint32_t addr)
+{
+    int       wt   = addr < ADBDMA_PAGES;
+    int       w    = (addr - (wt ? WTDMA_PAGES : ADBDMA_PAGES)) >> 2;
+    uint32_t  v    = R(addr);
+    v2_dma_t *bank = wt ? c->wt : c->adb;
+
+    for (int i = 0; i < 16; i++) {
+        v2_dma_t *d = &bank[w * 16 + i];
+        if (!d->touched)
+            continue;
+        int sh = 30 - 2 * i;
+        v      = (v & ~(3u << sh)) | ((uint32_t) d->page << sh);
+    }
+    return v;
+}
+
+static void
+fifo_ctrl_write(v2_chip_t *c, v2_dma_t *d, uint32_t old, uint32_t val)
+{
+    if ((val & FIFO_VALID) && !(old & FIFO_VALID)) {
+        dma_begin(c, d);
+        if (d->is_wt) {
+            v2_wtv_t *v = &c->wtv[d->ch];
+            memset(v, 0, sizeof(*v));
+        } else {
+            for (int r = 0; r < c->nroutes; r++) {
+                v2_route_t *rt = &c->route[r];
+                if (rt->src != d->ch)
+                    continue;
+                rt->cnt = 0;
+                if (rt->sink >= AK_SRCIN && rt->sink < AK_SRCIN + NR_SRC)
+                    memset(&c->src[rt->sink - AK_SRCIN], 0, sizeof(v2_src_t));
+            }
+        }
+    } else if (!(val & FIFO_VALID) && (old & FIFO_VALID))
+        d->state = DMA_IDLE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Routing graph                                                       */
+/* ------------------------------------------------------------------ */
+
+static void
+graph_rebuild(v2_chip_t *c)
+{
+    uint32_t sr = R(ADB_SR);
+
+    c->nroutes = 0;
+    memset(c->sink_n, 0, sizeof(c->sink_n));
+    memset(c->dma_nroutes, 0, sizeof(c->dma_nroutes));
+
+    for (int ch = 0; ch < ADB_NCHN; ch++) {
+        if (!(sr & (1u << ch)))
+            continue;
+        uint32_t r = R(ADB_CHNBASE + ch * 4) & 0xffff;
+        for (int guard = 0; guard < 256; guard++) {
+            if ((r & 0xff) == 0xff || c->nroutes >= MAX_ROUTES)
+                break;
+            uint8_t src = r >> 8, sink = r & 0xff;
+            if (src != 0xff && c->sink_n[sink] < MAX_PER_SINK) {
+                v2_route_t *rt = &c->route[c->nroutes];
+                rt->src        = src;
+                rt->sink       = sink;
+                rt->idx        = 0;
+                rt->cnt        = 0;
+                if (src < NR_ADBDMA) {
+                    rt->idx = c->dma_nroutes[src]++;
+                    rt->cnt = c->adb[src].frame_no;
+                }
+                c->sink_r[sink][c->sink_n[sink]++] = c->nroutes;
+                c->nroutes++;
+            }
+            r = R(ADB_RTBASE + (r & 0xff) * 4) & 0xffff;
+        }
+    }
+    c->graph_dirty = 0;
+    v2_log(c, "Vortex2: routing rebuilt, %d routes (ADB_SR %06x)\n", c->nroutes, sr);
+}
+
+/* ------------------------------------------------------------------ */
+/* Block evaluation                                                    */
+/* ------------------------------------------------------------------ */
+
+static const float *eval_src(v2_chip_t *c, int a);
+
+static const float *
+gather(v2_chip_t *c, int sink)
+{
+    float *o = c->kbuf[sink];
+
+    if (c->kstate[sink])
+        return o;
+    c->kstate[sink] = 1;
+    memset(o, 0, sizeof(float) * B);
+    for (int i = 0; i < c->sink_n[sink]; i++) {
+        v2_route_t *rt = &c->route[c->sink_r[sink][i]];
+        if (rt->src < NR_ADBDMA) {
+            /* A DMA channel feeding a 48 kHz sink directly. A converter
+               input pulls at its own rate instead (see src_run). */
+            if (sink >= AK_SRCIN && sink < AK_SRCIN + NR_SRC)
+                continue;
+            v2_dma_t *d = &c->adb[rt->src];
+            for (int n = 0; n < B; n++)
+                o[n] += dma_take(c, d, rt->idx, c->dma_nroutes[rt->src], &rt->cnt);
+        } else {
+            const float *s = eval_src(c, rt->src);
+            for (int n = 0; n < B; n++)
+                o[n] += s[n];
+        }
+    }
+    return o;
+}
+
+/* Sample-rate converter: CONVRATIO is the input rate over 48 kHz in Q14.
+   Fed from a DMA channel it pulls input at that ratio; fed from a 48 kHz
+   source (recording paths) it passes samples through and the capture
+   DMA applies the ratio. */
+static void
+src_run(v2_chip_t *c, int s, float *out)
+{
+    int         sink = AK_SRCIN + s;
+    v2_src_t   *st   = &c->src[s];
+    v2_route_t *dr   = NULL;
+
+    for (int i = 0; i < c->sink_n[sink]; i++) {
+        v2_route_t *rt = &c->route[c->sink_r[sink][i]];
+        if (rt->src < NR_ADBDMA) {
+            dr = rt;
+            break;
+        }
+    }
+    if (!dr) {
+        memcpy(out, gather(c, sink), sizeof(float) * B);
+        return;
+    }
+
+    v2_dma_t *d    = &c->adb[dr->src];
+    double    step = (double) (R(SRC_CONVRATIO + s * 4) & 0x3ffff) / 16384.0;
+    if (step > 8.0)
+        step = 8.0;
+    if (d->state == DMA_IDLE) {
+        memset(out, 0, sizeof(float) * B);
+        st->phase = 0.0;
+        return;
+    }
+    c->dbg |= 4;
+    for (int n = 0; n < B; n++) {
+        st->phase += step;
+        while (st->phase >= 1.0) {
+            st->phase -= 1.0;
+            st->hist[0] = st->hist[1];
+            st->hist[1] = st->hist[2];
+            st->hist[2] = st->hist[3];
+            st->hist[3] = dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin);
+        }
+        out[n] = interp4(st->hist, (float) st->phase);
+    }
+}
+
+/* Mixer output: sum of enabled inputs times their gains, times the
+   output gain. Current gains glide toward their targets. */
+static void
+mix_ramp(v2_chip_t *c)
+{
+    for (int i = 0; i < NR_MIXOUT * 32 + NR_MIXOUT; i++) {
+        uint32_t a_cur = (i < 512) ? (MIX_INVOL_B + i * 4) : (MIX_VOL_B + (i - 512) * 4);
+        uint32_t a_tgt = (i < 512) ? (MIX_INVOL_A + i * 4) : (MIX_VOL_A + (i - 512) * 4);
+        if (c->ro[(a_cur >> 2) >> 3] & (1 << ((a_cur >> 2) & 7)))
+            continue;
+        int cur = (int8_t) (R(a_cur) & 0xff);
+        int tgt = (int8_t) (R(a_tgt) & 0xff);
+        if (cur == tgt)
+            continue;
+        cur += (tgt > cur) ? ((tgt - cur > 4) ? 4 : tgt - cur) : ((cur - tgt > 4) ? -4 : tgt - cur);
+        R(a_cur) = (R(a_cur) & ~0xffu) | (uint8_t) cur;
+    }
+}
+
+static void
+mix_run(v2_chip_t *c, int m, float *out)
+{
+    memset(out, 0, sizeof(float) * B);
+    for (int i = 0; i < NR_MIXIN; i++) {
+        if (!(R(MIX_ENIN + ((m << 3) + (i >> 2)) * 4) & (1u << (i & 3))))
+            continue;
+        float g = mix_gain_tab[R(MIX_INVOL_B + ((m << 5) + i) * 4) & 0xff];
+        if (g == 0.0f && !c->sink_n[AK_MIXIN + i])
+            continue;
+        const float *in = gather(c, AK_MIXIN + i);
+        if (g == 0.0f)
+            continue;
+        for (int n = 0; n < B; n++)
+            out[n] += g * in[n];
+    }
+    float og = mix_gain_tab[R(MIX_VOL_B + m * 4) & 0xff];
+    for (int n = 0; n < B; n++)
+        out[n] *= og;
+}
+
+/* ------------------------------------------------------------------ */
+/* Wavetable voices                                                    */
+/*                                                                     */
+/* PARM0/PARM1 (identical apart from bit 0 = which side):              */
+/*   bits 31-24  high-frequency control, 0xcf = open (low-pass;         */
+/*               mapping is a hypothesis)                              */
+/*   bits 23-16  gain, 0x10 per 6 dB, 0xcf = unity, 0 = silent         */
+/*   bits 15-0   rate: e = bits 15-13, m = bits 12-0,                  */
+/*               rate = 48 kHz * 2^(e-5) * (1 + m/8192)  (confirmed     */
+/*               against measured DMA consumption)                     */
+/* A voice with its DSREG bit set feeds its own ADB source address     */
+/* (bank base + voice), which the driver routes to an A3D input when   */
+/* it runs out of ADB channels. Otherwise PARM0's gain sends it to     */
+/* the bank's mixed output 32 and PARM1's to 33.                       */
+/* ------------------------------------------------------------------ */
+
+static inline float
+wt_gain(uint32_t p)
+{
+    int g = (p >> 16) & 0xff;
+    return g ? powf(2.0f, (float) (g - 0xcf) / 16.0f) : 0.0f;
+}
+
+static void
+wt_bank_run(v2_chip_t *c, int bank)
+{
+    uint32_t bb = bank * WT_BANK_STRIDE;
+    uint32_t ds = R(bb + WT_DSREG);
+
+    memset(c->wt_direct[bank], 0, sizeof(c->wt_direct[bank]));
+    memset(c->wt_bus[bank], 0, sizeof(c->wt_bus[bank]));
+    for (int lv = 0; lv < 32; lv++) {
+        int       v = bank * 32 + lv;
+        v2_dma_t *d = &c->wt[v];
+        v2_wtv_t *w = &c->wtv[v];
+        if (d->state == DMA_IDLE)
+            continue;
+        c->dbg |= 2;
+        uint32_t p0   = R(bb + WT_PARM + lv * 0x10);
+        uint32_t p1   = R(bb + WT_PARM + lv * 0x10 + 4);
+        uint32_t rate = p0 & 0xffff;
+        double   step = ldexp(1.0 + (double) (rate & 0x1fff) / 8192.0, (int) (rate >> 13) - 5);
+        float    gl   = wt_gain(p0);
+        float    gr   = wt_gain(p1);
+        int      f    = (p0 >> 24) & 0xff;
+        float    a    = (f >= 0xcf) ? 1.0f : powf(2.0f, (float) (f - 0xcf) / 16.0f);
+        int      dir  = (ds >> lv) & 1;
+        float   *od   = c->wt_direct[bank][lv];
+        float   *bl   = c->wt_bus[bank][0];
+        float   *br   = c->wt_bus[bank][1];
+
+        for (int n = 0; n < B; n++) {
+            w->phase += step;
+            while (w->phase >= 1.0) {
+                w->phase -= 1.0;
+                w->hist[0] = w->hist[1];
+                w->hist[1] = w->hist[2];
+                w->hist[2] = w->hist[3];
+                w->hist[3] = dma_take(c, d, 0, 1, &w->nin);
+            }
+            float y = interp4(w->hist, (float) w->phase);
+            w->lp += a * (y - w->lp);
+            if (dir)
+                od[n] = w->lp * gl;
+            else {
+                bl[n] += w->lp * gl;
+                br[n] += w->lp * gr;
+            }
+        }
+    }
+    c->wt_done[bank] = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* A3D engine                                                          */
+/*                                                                     */
+/* 16 sources (4 slices x 4). Bank B per source at 0x19000 + slice *   */
+/* 0x2000 + source * 0x2c8:                                            */
+/*   +0x000 HrtfCurrent[56]  +0x100 HrtfTarget[56]: Q15 taps, low half */
+/*          left ear, high half right ear                              */
+/*   +0x0e0/0x0e4 Gain current/target: Q15 (16 bits)                   */
+/*   +0x0e8/0x0ec atmospheric a1 (low) / a2 (high), Q14                */
+/*   +0x0f0/0x0f4 b0 (low) / b1 (high), Q14; +0x0f8/0x0fc b2           */
+/*   +0x1e0/0x1e4 ITD current/target: delay in 1/512 sample, low half  */
+/*          left ear, high half right ear                              */
+/* Bank A (0x18000 + slice * 0x2000 + source * 0x3a4) +0x37c..0x388    */
+/* hold the glide time constants (HRTF, gain, filter, ITD): current    */
+/* values approach targets with tau = 2^21 / TC samples. The ITD       */
+/* glides faster than that rule; 2^18 / TC is a working guess.         */
+/* Outputs: slice s left/right = ADB sources A3DOUT(2s)/(2s+1).        */
+/* ------------------------------------------------------------------ */
+
+static inline uint32_t a3d_b(int s) { return A3D_BASE + 0x1000 + (s >> 2) * 0x2000 + (s & 3) * 0x2c8; }
+static inline uint32_t a3d_a(int s) { return A3D_BASE + (s >> 2) * 0x2000 + (s & 3) * 0x3a4; }
+
+static void
+a3d_load_current(v2_chip_t *c, int s)
+{
+    v2_a3d_t *a  = &c->a3d[s];
+    uint32_t  bb = a3d_b(s);
+
+    for (int k = 0; k < HRTF_TAPS; k++) {
+        uint32_t w = R(bb + k * 4);
+        a->h[0][k] = LO16(w) / 32768.0f;
+        a->h[1][k] = HI16(w) / 32768.0f;
+    }
+    a->gain   = LO16(R(bb + 0xe0)) / 32768.0f;
+    a->co[0]  = LO16(R(bb + 0xe8)) / 16384.0f;
+    a->co[1]  = HI16(R(bb + 0xe8)) / 16384.0f;
+    a->co[2]  = LO16(R(bb + 0xf0)) / 16384.0f;
+    a->co[3]  = HI16(R(bb + 0xf0)) / 16384.0f;
+    a->co[4]  = LO16(R(bb + 0xf8)) / 16384.0f;
+    a->itd[0] = (float) (uint16_t) R(bb + 0x1e0) / 512.0f;
+    a->itd[1] = (float) (uint16_t) (R(bb + 0x1e0) >> 16) / 512.0f;
+    a->loaded = 1;
+}
+
+static inline uint32_t
+pack16(float lo, float hi, float scale)
+{
+    int l = (int) lrintf(clampf(lo * scale, -32768.0f, 32767.0f));
+    int h = (int) lrintf(clampf(hi * scale, -32768.0f, 32767.0f));
+    return ((uint32_t) (uint16_t) h << 16) | (uint16_t) l;
+}
+
+static inline float
+glide_k(uint32_t tc, double shift)
+{
+    double k;
+
+    tc &= 0xffff;
+    if (!tc)
+        return 0.0f;
+    k = (double) tc / shift;
+    if (k >= 1.0)
+        return 1.0f;
+    return (float) (1.0 - pow(1.0 - k, B));
+}
+
+static void
+a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
+{
+    v2_a3d_t    *a  = &c->a3d[s];
+    uint32_t     bb = a3d_b(s);
+    uint32_t     ba = a3d_a(s);
+    const float *x  = gather(c, AK_A3DIN + s);
+
+    if (!a->loaded || c->a3d_cur_dirty[s])
+        a3d_load_current(c, s);
+    c->a3d_cur_dirty[s] = 0;
+
+    /* Glide current values toward the targets. */
+    float kh = glide_k(R(ba + 0x37c), 2097152.0);
+    float kg = glide_k(R(ba + 0x380), 2097152.0);
+    float kc = glide_k(R(ba + 0x384), 2097152.0);
+    float ki = glide_k(R(ba + 0x388), 262144.0);
+    if (kh > 0.0f)
+        for (int k = 0; k < HRTF_TAPS; k++) {
+            uint32_t w = R(bb + 0x100 + k * 4);
+            a->h[0][k] += (LO16(w) / 32768.0f - a->h[0][k]) * kh;
+            a->h[1][k] += (HI16(w) / 32768.0f - a->h[1][k]) * kh;
+        }
+    if (kg > 0.0f)
+        a->gain += (LO16(R(bb + 0xe4)) / 32768.0f - a->gain) * kg;
+    if (kc > 0.0f) {
+        float t[5] = { LO16(R(bb + 0xec)) / 16384.0f, HI16(R(bb + 0xec)) / 16384.0f,
+                       LO16(R(bb + 0xf4)) / 16384.0f, HI16(R(bb + 0xf4)) / 16384.0f,
+                       LO16(R(bb + 0xfc)) / 16384.0f };
+        for (int i = 0; i < 5; i++)
+            a->co[i] += (t[i] - a->co[i]) * kc;
+    }
+    if (ki > 0.0f) {
+        a->itd[0] += ((float) (uint16_t) R(bb + 0x1e4) / 512.0f - a->itd[0]) * ki;
+        a->itd[1] += ((float) (uint16_t) (R(bb + 0x1e4) >> 16) / 512.0f - a->itd[1]) * ki;
+    }
+
+    /* Make the current values visible to the driver. */
+    for (int k = 0; k < HRTF_TAPS; k++)
+        R(bb + k * 4) = pack16(a->h[0][k], a->h[1][k], 32768.0f);
+    R(bb + 0xe0)  = (R(bb + 0xe0) & 0xffff0000) | (uint16_t) lrintf(clampf(a->gain * 32768.0f, -32768.0f, 32767.0f));
+    R(bb + 0xe8)  = pack16(a->co[0], a->co[1], 16384.0f);
+    R(bb + 0xf0)  = pack16(a->co[2], a->co[3], 16384.0f);
+    R(bb + 0xf8)  = pack16(a->co[4], 0.0f, 16384.0f);
+    R(bb + 0x1e0) = ((uint32_t) (uint16_t) lrintf(clampf(a->itd[1] * 512.0f, 0.0f, 65535.0f)) << 16)
+        | (uint16_t) lrintf(clampf(a->itd[0] * 512.0f, 0.0f, 65535.0f));
+
+    c->dbg |= 1;
+
+    /* Atmospheric filter and gain, then per ear: ITD delay and the FIR. */
+    float d[2];
+    for (int e = 0; e < 2; e++) {
+        d[e] = a->itd[e];
+        if (d[e] > ITD_LEN - 4)
+            d[e] = ITD_LEN - 4;
+    }
+    for (int n = 0; n < B; n++) {
+        float y = a->co[2] * x[n] + a->co[3] * a->x1 + a->co[4] * a->x2 + a->co[0] * a->y1 + a->co[1] * a->y2;
+        a->x2   = a->x1;
+        a->x1   = x[n];
+        a->y2   = a->y1;
+        a->y1   = y;
+        y *= a->gain;
+        a->dlpos = (a->dlpos + 1) & (ITD_LEN - 1);
+        for (int e = 0; e < 2; e++) {
+            a->dl[e][a->dlpos] = y;
+            int   di           = (int) d[e];
+            float fr           = d[e] - (float) di;
+            float s0           = a->dl[e][(a->dlpos - di) & (ITD_LEN - 1)];
+            float s1           = a->dl[e][(a->dlpos - di - 1) & (ITD_LEN - 1)];
+            a->fh[e][HRTF_TAPS - 1 + n] = s0 + (s1 - s0) * fr;
+        }
+    }
+    for (int e = 0; e < 2; e++) {
+        float *o = e ? outr : outl;
+        float *h = a->fh[e];
+        for (int n = 0; n < B; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < HRTF_TAPS; k++)
+                acc += a->h[e][k] * h[HRTF_TAPS - 1 + n - k];
+            o[n] += acc;
+        }
+        memmove(h, h + B, sizeof(float) * (HRTF_TAPS - 1));
+    }
+}
+
+static void
+a3d_run(v2_chip_t *c)
+{
+    memset(c->a3d_out, 0, sizeof(c->a3d_out));
+    for (int s = 0; s < NR_A3D; s++) {
+        if (!c->sink_n[AK_A3DIN + s]) {
+            if (c->a3d[s].active) {
+                memset(&c->a3d[s], 0, sizeof(c->a3d[s]));
+                c->a3d_cur_dirty[s] = 1;
+            }
+            continue;
+        }
+        c->a3d[s].active = 1;
+        a3d_slot_run(c, s, c->a3d_out[(s >> 2) * 2], c->a3d_out[(s >> 2) * 2 + 1]);
+    }
+    c->a3d_done = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Crosstalk canceller                                                 */
+/*                                                                     */
+/* The coefficient words are not decoded yet, so the driver's three    */
+/* settings are recognised and replaced by measured responses: all    */
+/* gain words zero = headphones (pass-through); otherwise the delay    */
+/* field of 0x24660 tells "satellites" (0xd) from "monitors" (0x7).    */
+/* The measured filters run as uniformly partitioned FFT convolution.  */
+/* ------------------------------------------------------------------ */
+
+static void
+fft(v2_chip_t *c, cpx *x, int inverse)
+{
+    for (int i = 0; i < XT_N; i++)
+        if (c->rev[i] > i) {
+            cpx t        = x[i];
+            x[i]         = x[c->rev[i]];
+            x[c->rev[i]] = t;
+        }
+    for (int len = 2; len <= XT_N; len <<= 1) {
+        int half = len >> 1, step = XT_N / len;
+        for (int i = 0; i < XT_N; i += len)
+            for (int j = 0; j < half; j++) {
+                cpx w = c->tw[j * step];
+                if (inverse)
+                    w.im = -w.im;
+                cpx u = x[i + j], v = x[i + j + half];
+                cpx t = { v.re * w.re - v.im * w.im, v.re * w.im + v.im * w.re };
+                x[i + j]        = (cpx) { u.re + t.re, u.im + t.im };
+                x[i + j + half] = (cpx) { u.re - t.re, u.im - t.im };
+            }
+    }
+}
+
+static void
+xt_prepare(v2_chip_t *c)
+{
+    static float hs[XT_P * B], hc[XT_P * B];
+    const float *E[2] = { v2_xt_wide_E, v2_xt_narrow_E };
+    const float *X[2] = { v2_xt_wide_X, v2_xt_narrow_X };
+
+    for (int i = 0; i < XT_N; i++) {
+        int r = 0;
+        for (int b = 1, j = i; b < XT_N; b <<= 1, j >>= 1)
+            r = (r << 1) | (j & 1);
+        c->rev[i] = r;
+    }
+    for (int i = 0; i < XT_N / 2; i++)
+        c->tw[i] = (cpx) { (float) cos(-2.0 * M_PI * i / XT_N), (float) sin(-2.0 * M_PI * i / XT_N) };
+
+    for (int m = 0; m < 2; m++) {
+        /* same side: E delayed by the model latency; cross: E * X */
+        memset(hs, 0, sizeof(hs));
+        memset(hc, 0, sizeof(hc));
+        for (int i = 0; i < V2_XT_TAPS && i + V2_XT_LATENCY < XT_P * B; i++)
+            hs[i + V2_XT_LATENCY] = E[m][i];
+        for (int i = 0; i < V2_XT_TAPS; i++)
+            for (int j = 0; j < V2_XT_TAPS && i + j < XT_P * B; j++)
+                hc[i + j] += E[m][i] * X[m][j];
+        for (int p = 0; p < XT_P; p++) {
+            cpx bs[XT_N], bc[XT_N];
+            for (int i = 0; i < XT_N; i++) {
+                bs[i] = (cpx) { (i < B) ? hs[p * B + i] : 0.0f, 0.0f };
+                bc[i] = (cpx) { (i < B) ? hc[p * B + i] : 0.0f, 0.0f };
+            }
+            fft(c, bs, 0);
+            fft(c, bc, 0);
+            memcpy(c->xt_h[m][0][p], bs, sizeof(bs));
+            memcpy(c->xt_h[m][1][p], bc, sizeof(bc));
+        }
+    }
+}
+
+static void
+xt_detect(v2_chip_t *c)
+{
+    int mode = 0;
+
+    if ((R(XT_GAIN_EQL) | R(XT_GAIN_EQR) | R(XT_GAIN_XTL) | R(XT_GAIN_XTR)) & 0xffff) {
+        int delay = (R(XT_CTRL) >> 8) & 0x1f;
+        mode      = (delay == 0x0d) ? 1 : ((delay == 0x07) ? 2 : 0);
+    }
+    if (mode != c->xt.mode) {
+        v2_log(c, "Vortex2: crosstalk canceller %s\n", mode == 1 ? "satellites" : (mode == 2 ? "monitors" : "pass-through"));
+        memset(&c->xt, 0, sizeof(c->xt));
+        c->xt.mode = mode;
+    }
+    c->xt_dirty = 0;
+}
+
+static void
+xt_run(v2_chip_t *c)
+{
+    float in[2][B];
+
+    for (int s = 0; s < 2; s++) {
+        memset(in[s], 0, sizeof(in[s]));
+        for (int k = 0; k < 5; k++) {
+            int sink = AK_XTIN + s * 5 + k;
+            if (!c->sink_n[sink])
+                continue;
+            const float *g = gather(c, sink);
+            for (int n = 0; n < B; n++)
+                in[s][n] += g[n];
+        }
+    }
+    if (c->xt_dirty)
+        xt_detect(c);
+
+    if (c->xt.mode == 0) {
+        memcpy(c->xt_out, in, sizeof(in));
+    } else {
+        v2_xt_t *x = &c->xt;
+        int      m = x->mode - 1;
+        x->head    = (x->head + 1) % XT_P;
+        for (int s = 0; s < 2; s++) {
+            cpx *f = x->fdl[s][x->head];
+            for (int i = 0; i < B; i++) {
+                f[i]     = (cpx) { x->prev[s][i], 0.0f };
+                f[i + B] = (cpx) { in[s][i], 0.0f };
+            }
+            memcpy(x->prev[s], in[s], sizeof(in[s]));
+            fft(c, f, 0);
+        }
+        for (int s = 0; s < 2; s++) {
+            cpx y[XT_N];
+            memset(y, 0, sizeof(y));
+            for (int p = 0; p < XT_P; p++) {
+                int        slot = (x->head - p + XT_P) % XT_P;
+                const cpx *xs   = x->fdl[s][slot];
+                const cpx *xo   = x->fdl[s ^ 1][slot];
+                const cpx *hs   = c->xt_h[m][0][p];
+                const cpx *hc   = c->xt_h[m][1][p];
+                for (int k = 0; k < XT_N; k++) {
+                    y[k].re += xs[k].re * hs[k].re - xs[k].im * hs[k].im + xo[k].re * hc[k].re - xo[k].im * hc[k].im;
+                    y[k].im += xs[k].re * hs[k].im + xs[k].im * hs[k].re + xo[k].re * hc[k].im + xo[k].im * hc[k].re;
+                }
+            }
+            fft(c, y, 1);
+            for (int n = 0; n < B; n++)
+                c->xt_out[s][n] = y[B + n].re / XT_N;
+        }
+    }
+    c->xt_done = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Hardware EQ: output = bypass (Q15) x input + sum over ten octave     */
+/* band-pass sections (a1, a2, b0, b1, b2 in Q14) times band gain      */
+/* (Q15). Left at 0x2b000, right at 0x2b1e0, 0x30 per band, gain at    */
+/* +0x2c.                                                              */
+/* ------------------------------------------------------------------ */
+
+static void
+eq_load(v2_chip_t *c)
+{
+    for (int s = 0; s < 2; s++) {
+        uint32_t base = s ? 0x2b1e0 : EQ_BASE;
+        for (int b = 0; b < 10; b++) {
+            for (int j = 0; j < 5; j++)
+                c->eq.co[s][b][j] = LO16(R(base + b * 0x30 + j * 4)) / 16384.0f;
+            c->eq.gain[s][b] = LO16(R(base + b * 0x30 + 0x2c)) / 32768.0f;
+        }
+        c->eq.bypass[s] = LO16(R(s ? EQ_BYPASS_R : EQ_BYPASS_L)) / 32768.0f;
+    }
+    c->eq_dirty = 0;
+}
+
+static void
+eq_run(v2_chip_t *c)
+{
+    if (c->eq_dirty)
+        eq_load(c);
+    for (int s = 0; s < 2; s++) {
+        const float *x = gather(c, AK_EQIN + s);
+        float       *o = c->eq_out[s];
+        for (int n = 0; n < B; n++)
+            o[n] = c->eq.bypass[s] * x[n];
+        for (int b = 0; b < 10; b++) {
+            float g = c->eq.gain[s][b];
+            if (g == 0.0f)
+                continue;
+            float *co = c->eq.co[s][b], *st = c->eq.st[s][b];
+            for (int n = 0; n < B; n++) {
+                float y = co[2] * x[n] + co[3] * st[0] + co[4] * st[1] + co[0] * st[2] + co[1] * st[3];
+                st[1]   = st[0];
+                st[0]   = x[n];
+                st[3]   = st[2];
+                st[2]   = y;
+                o[n] += g * y;
+            }
+        }
+    }
+    c->eq_done = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Source evaluation                                                   */
+/* ------------------------------------------------------------------ */
+
+static const float *
+eval_src(v2_chip_t *c, int a)
+{
+    float *o = c->sbuf[a];
+
+    if (c->sstate[a] == 2)
+        return o;
+    if (c->sstate[a] == 1)
+        return o; /* feedback loop: previous block's values */
+    c->sstate[a] = 1;
+
+    if (a < NR_ADBDMA) {
+        /* handled in gather() */
+        memset(o, 0, sizeof(float) * B);
+    } else if (a < AS_SRCOUT + NR_SRC) {
+        src_run(c, a - AS_SRCOUT, o);
+    } else if (a < AS_MIXOUT + NR_MIXOUT) {
+        mix_run(c, a - AS_MIXOUT, o);
+    } else if (a < AS_XTOUT || (a >= AS_WT1 && a < AS_A3DOUT)) {
+        int bank = (a >= AS_WT1);
+        int i    = a - (bank ? AS_WT1 : AS_WT0);
+        if (!c->wt_done[bank])
+            wt_bank_run(c, bank);
+        if (i < 32)
+            memcpy(o, c->wt_direct[bank][i], sizeof(float) * B);
+        else
+            memcpy(o, c->wt_bus[bank][i - 32], sizeof(float) * B);
+    } else if (a < AS_XTOUT + 2) {
+        if (!c->xt_done)
+            xt_run(c);
+        memcpy(o, c->xt_out[a - AS_XTOUT], sizeof(float) * B);
+    } else if (a == AS_EQOUT || a == AS_EQOUT + 1) {
+        if (!c->eq_done)
+            eq_run(c);
+        memcpy(o, c->eq_out[a - AS_EQOUT], sizeof(float) * B);
+    } else if (a >= AS_A3DOUT && a < AS_A3DOUT + 8) {
+        if (!c->a3d_done)
+            a3d_run(c);
+        memcpy(o, c->a3d_out[a - AS_A3DOUT], sizeof(float) * B);
+    } else {
+        /* codec, S/PDIF, serial port and effects inputs: silence */
+        memset(o, 0, sizeof(float) * B);
+    }
+    c->sstate[a] = 2;
+    return o;
+}
+
+/* Capture DMA: sink d (left) and d + 0x20 (right) at the rate of the
+   converter that feeds them, or 48 kHz. */
+static void
+capture_run(v2_chip_t *c, int ch)
+{
+    v2_dma_t *d = &c->adb[ch];
+    int       nch;
+    uint32_t  step = 0x10000;
+
+    if (d->state == DMA_IDLE || d->state == DMA_END || (R(dma_ctrl(d)) & 0x2000))
+        return;
+    nch = c->sink_n[AK_DMAB + ch] ? 2 : 1;
+    const float *l = gather(c, ch);
+    const float *r = (nch == 2) ? gather(c, AK_DMAB + ch) : l;
+    for (int i = 0; i < c->sink_n[ch]; i++) {
+        v2_route_t *rt = &c->route[c->sink_r[ch][i]];
+        if (rt->src >= AS_SRCOUT && rt->src < AS_SRCOUT + NR_SRC) {
+            uint32_t cr = R(SRC_CONVRATIO + (rt->src - AS_SRCOUT) * 4) & 0x3ffff;
+            if (cr && cr < 0x4000)
+                step = cr << 2;
+            else if (cr > 0x4000)
+                step = (uint32_t) ((0x4000ull << 16) / cr);
+        }
+    }
+    for (int n = 0; n < B; n++) {
+        d->rate_acc += step;
+        if (d->rate_acc >= 0x10000) {
+            float v[2] = { l[n], r[n] };
+            d->rate_acc -= 0x10000;
+            dma_put_frame(c, d, v, nch);
+        }
+    }
+}
+
+void
+v2_run_block(v2_chip_t *c, float *out)
+{
+    if (c->graph_dirty)
+        graph_rebuild(c);
+
+    c->dbg = 0;
+    memset(c->sstate, 0, sizeof(c->sstate));
+    memset(c->kstate, 0, sizeof(c->kstate));
+    c->wt_done[0] = c->wt_done[1] = 0;
+    c->a3d_done = c->xt_done = c->eq_done = 0;
+    mix_ramp(c);
+
+    const float *fl = gather(c, AK_CODEC + 0);
+    const float *fr = gather(c, AK_CODEC + 1);
+    const float *rl = gather(c, AK_CODEC + 4);
+    const float *rr = gather(c, AK_CODEC + 5);
+    for (int n = 0; n < B; n++) {
+        out[n * 4 + 0] = fl[n];
+        out[n * 4 + 1] = fr[n];
+        out[n * 4 + 2] = rl[n];
+        out[n * 4 + 3] = rr[n];
+    }
+
+    /* Everything else with routes still runs, so streams keep moving
+       even when their path is muted or unrouted. */
+    for (int s = 0; s < 256; s++)
+        if (c->sink_n[s] && !c->kstate[s] && !(s < 0x40))
+            gather(c, s);
+    for (int ch = 0; ch < NR_ADBDMA; ch++)
+        if (c->sink_n[ch])
+            capture_run(c, ch);
+    for (int bank = 0; bank < 2; bank++)
+        if (!c->wt_done[bank])
+            wt_bank_run(c, bank);
+    /* Playback DMA channels with no consumer at all still drain. */
+    for (int ch = 0; ch < NR_ADBDMA; ch++) {
+        v2_dma_t *d = &c->adb[ch];
+        if ((d->state == DMA_RUN || d->state == DMA_STALL) && !c->dma_nroutes[ch] && (R(dma_ctrl(d)) & 0x2000)) {
+            uint32_t cnt = d->frame_no;
+            for (int n = 0; n < B; n++)
+                dma_take(c, d, 0, 1, &cnt);
+        }
+    }
+}
+
+uint32_t
+v2_debug_flags(v2_chip_t *c)
+{
+    return c->dbg;
+}
+
+/* ------------------------------------------------------------------ */
+/* Register access                                                     */
+/* ------------------------------------------------------------------ */
+
+static inline int
+is_ro(v2_chip_t *c, uint32_t a)
+{
+    uint32_t w = a >> 2;
+    return (c->ro[w >> 3] >> (w & 7)) & 1;
+}
+
+uint32_t
+v2_read(v2_chip_t *c, uint32_t addr)
+{
+    uint32_t v;
+
+    addr &= (V2_REG_SIZE - 4);
+    if (addr >= DECODE_END)
+        return c->last_bus;
+
+    switch (addr) {
+        case SMP_TIME:
+            v = c->host.clock ? c->host.clock(c->host.priv) : 0;
+            break;
+        case SMP_TIMER:
+            /* bit 31: timer has fired; the read acknowledges it */
+            /* bits 15-0: samples left in the current period */
+            v = (c->timer_fired ? 0x80000000u : 0);
+            if ((c->timer_last & 0xffff) && c->host.clock) {
+                uint32_t n  = c->timer_last & 0xffff;
+                uint32_t el = ((c->host.clock(c->host.priv) - c->timer_t0) >> 8) % n;
+                v |= n - el;
+            }
+            c->timer_fired = 0;
+            c->irq_src &= ~IRQ_TIMER;
+            update_irq(c);
+            break;
+        case IRQ_SOURCE:
+            v = c->irq_src | IRQ_ALWAYS;
+            break;
+        case IRQ_STAT:
+            v = (R(IRQ_STAT) & ~1u) | (c->irq_level ? 1 : 0);
+            break;
+        case CODEC_CTRL:
+            v = R(CODEC_CTRL) | 0x100; /* codec ready */
+            break;
+        default:
+            if (addr >= WTDMA_STAT && addr < WTDMA_STAT + NR_WTDMA * 4)
+                v = c->wt[(addr - WTDMA_STAT) >> 2].touched ? dma_stat(c, &c->wt[(addr - WTDMA_STAT) >> 2]) : R(addr);
+            else if (addr >= ADBDMA_STAT && addr < ADBDMA_STAT + NR_ADBDMA * 4)
+                v = c->adb[(addr - ADBDMA_STAT) >> 2].touched ? dma_stat(c, &c->adb[(addr - ADBDMA_STAT) >> 2]) : R(addr);
+            else if (addr >= WTDMA_PAGES && addr < ADBDMA_PAGES + 8)
+                v = dma_pages_word(c, addr);
+            else if (addr >= FIFO_WTCTRL && addr < FIFO_ADBCTRL + NR_ADBDMA * 4) {
+                int       wt = addr < FIFO_ADBCTRL;
+                v2_dma_t *d  = wt ? &c->wt[(addr - FIFO_WTCTRL) >> 2] : &c->adb[(addr - FIFO_ADBCTRL) >> 2];
+                v            = R(addr) & ~FIFO_EMPTY;
+                if (d->fn == 0 && d->state != DMA_RUN)
+                    v |= FIFO_EMPTY;
+            } else
+                v = R(addr);
+            break;
+    }
+    c->last_bus = v;
+    return v;
+}
+
+void
+v2_write(v2_chip_t *c, uint32_t addr, uint32_t val)
+{
+    uint32_t old;
+
+    addr &= (V2_REG_SIZE - 4);
+    c->last_bus = val;
+    if (addr >= DECODE_END || is_ro(c, addr))
+        return;
+    old     = R(addr);
+    R(addr) = val;
+
+    if (addr >= A3D_BASE && addr < A3D_END) {
+        uint32_t off = (addr - A3D_BASE) & 0x1fff;
+        if (off >= 0x1000 && off < 0x1000 + 4 * 0x2c8) {
+            int      s   = ((addr - A3D_BASE) >> 13) * 4 + (off - 0x1000) / 0x2c8;
+            uint32_t rel = (off - 0x1000) % 0x2c8;
+            if (rel < 0xe0 || rel == 0xe0 || rel == 0xe8 || rel == 0xf0 || rel == 0xf8 || rel == 0x1e0)
+                c->a3d_cur_dirty[s] = 1;
+        }
+        return;
+    }
+    if (addr >= FIFO_WTCTRL && addr < FIFO_ADBCTRL + NR_ADBDMA * 4) {
+        int       wt = addr < FIFO_ADBCTRL;
+        v2_dma_t *d  = wt ? &c->wt[(addr - FIFO_WTCTRL) >> 2] : &c->adb[(addr - FIFO_ADBCTRL) >> 2];
+        fifo_ctrl_write(c, d, old, val);
+        return;
+    }
+    if ((addr >= ADB_RTBASE && addr < ADB_CHNBASE + ADB_NCHN * 4) || addr == ADB_SR) {
+        if (addr != ADB_SR)
+            R(addr) = val &= 0xffff; /* route words are 16 bits wide */
+        if (old != val)
+            c->graph_dirty = 1;
+        return;
+    }
+    if (addr >= XT_BASE && addr < XT_END) {
+        c->xt_dirty = 1;
+        return;
+    }
+    if (addr >= EQ_BASE && addr < EQ_END) {
+        c->eq_dirty = 1;
+        return;
+    }
+    switch (addr) {
+        case CODEC_IO:
+            if (val & 0x00800000) {
+                if (c->host.codec_write)
+                    c->host.codec_write(c->host.priv, (val >> 16) & 0x7f, val & 0xffff);
+            } else {
+                uint8_t  reg = (val >> 16) & 0x7f;
+                uint16_t d   = c->host.codec_read ? c->host.codec_read(c->host.priv, reg) : 0xffff;
+                R(addr)      = 0x00800000 | ((uint32_t) reg << 16) | d; /* bit 23 set when the reply is in */
+            }
+            break;
+        case SMP_TIMER:
+            c->timer_last  = val;
+            c->timer_t0    = c->host.clock ? c->host.clock(c->host.priv) : 0;
+            c->timer_fired = 0;
+            c->irq_src &= ~IRQ_TIMER;
+            update_irq(c);
+            if (c->host.timer_arm)
+                c->host.timer_arm(c->host.priv, val & 0xffff);
+            break;
+        case IRQ_SOURCE:
+            R(addr) = old;
+            c->irq_src &= ~val;
+            update_irq(c);
+            break;
+        case IRQ_CTRL:
+        case CHIP_CTRL:
+            update_irq(c);
+            break;
+        default:
+            break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Lifetime                                                            */
+/* ------------------------------------------------------------------ */
+
+void
+v2_reset(v2_chip_t *c)
+{
+    memset(c->regs, 0, sizeof(c->regs));
+    memset(c->ro, 0, sizeof(c->ro));
+    for (size_t i = 0; i < sizeof(vortex2_reset_runs) / sizeof(vortex2_reset_runs[0]); i++) {
+        const vortex2_reset_run_t *r = &vortex2_reset_runs[i];
+        for (uint32_t w = r->word; w < (uint32_t) r->word + r->count; w++) {
+            c->regs[w] = r->value;
+            if (r->ro)
+                c->ro[w >> 3] |= 1 << (w & 7);
+        }
+    }
+    R(CODEC_CTRL) = 0x00008100;
+    c->last_bus   = 0xdeadbabe;
+    c->irq_src    = R(IRQ_SOURCE) & ~IRQ_ALWAYS;
+    c->irq_level  = 0;
+    c->timer_fired = 0;
+    c->timer_last  = 0;
+    if (c->host.set_irq)
+        c->host.set_irq(c->host.priv, 0);
+    if (c->host.timer_arm)
+        c->host.timer_arm(c->host.priv, 0);
+
+    for (int i = 0; i < NR_ADBDMA; i++) {
+        memset(&c->adb[i], 0, sizeof(v2_dma_t));
+        c->adb[i].ch = i;
+    }
+    for (int i = 0; i < NR_WTDMA; i++) {
+        memset(&c->wt[i], 0, sizeof(v2_dma_t));
+        c->wt[i].ch    = i;
+        c->wt[i].is_wt = 1;
+    }
+    memset(c->src, 0, sizeof(c->src));
+    memset(c->wtv, 0, sizeof(c->wtv));
+    memset(c->a3d, 0, sizeof(c->a3d));
+    memset(c->a3d_cur_dirty, 1, sizeof(c->a3d_cur_dirty));
+    memset(&c->xt, 0, sizeof(c->xt));
+    memset(&c->eq, 0, sizeof(c->eq));
+    memset(c->sbuf, 0, sizeof(c->sbuf));
+    c->graph_dirty = 1;
+    c->xt_dirty    = 1;
+    c->eq_dirty    = 1;
+}
+
+v2_chip_t *
+v2_create(const v2_host_t *host)
+{
+    v2_chip_t *c = calloc(1, sizeof(v2_chip_t));
+
+    if (!c)
+        return NULL;
+    init_tables();
+    c->host = *host;
+    xt_prepare(c);
+    v2_reset(c);
+    return c;
+}
+
+void
+v2_destroy(v2_chip_t *c)
+{
+    free(c);
+}
+
+/* Diagnostics: last block's samples at an ADB source address. */
+const float *
+v2_debug_source(v2_chip_t *c, int addr)
+{
+    return c->sbuf[addr & 0xff];
+}

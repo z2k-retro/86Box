@@ -266,6 +266,7 @@ static const SOUND_CARD sound_cards[] = {
     { &ess_solo1_device             },
     { &es1373_device                },
     { &ct5880_device                },
+    { &vortex2_device               },
     /* AC97 */
     { &ad1881_device                },
     { &cs4297a_device               },
