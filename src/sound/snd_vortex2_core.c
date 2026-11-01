@@ -253,6 +253,7 @@ struct v2_chip_t {
     uint8_t  a3d_cur_dirty[NR_A3D];
     uint8_t  a3d_used[NR_A3D];
     uint32_t graph_hash;
+    uint32_t glide_frames; /* sample count for the 64-sample glide tick */
     uint32_t wt_routed[2]; /* voices whose own ADB source is routed somewhere */
 
     int     xt_dirty;
@@ -1018,10 +1019,10 @@ wt_bank_run(v2_chip_t *c, int bank)
 /*          left ear, high half right ear                              */
 /* Bank A (0x18000 + slice * 0x2000 + source * 0x3a4) +0x37c..0x388    */
 /* hold the glide time constants (HRTF, gain, filter, ITD): current    */
-/* values approach targets exponentially with tau = 2^21 / TC samples */
-/* for gain, filter and HRTF, and 2^19 / TC for the ITD (fitted to a   */
-/* sweep of all four TC words on real hardware; HRTF may be nearer     */
-/* 2^20.5 and is still to be read back directly).                      */
+/* values step toward targets every 64 samples by TC * 64 / 2^21 of    */
+/* the remaining distance for gain, filter and HRTF, and TC * 64 / 2^19 */
+/* for the ITD (tau = 2^21 / TC and 2^19 / TC samples): read back from  */
+/* the chip's current registers on a real card for every TC word.      */
 /* Outputs: slice s left/right = ADB sources A3DOUT(2s)/(2s+1).        */
 /* ------------------------------------------------------------------ */
 
@@ -1063,17 +1064,18 @@ pack16(float lo, float hi, float scale)
 }
 
 static inline float
-glide_k(uint32_t tc, double shift)
+glide_k(const v2_chip_t *c, uint32_t tc, double shift)
 {
     double k;
 
+    /* The chip updates current values once every 64 samples, moving them
+       tc * 64 / shift of the way to the target (read back from a real
+       card: at tc 0xc00, exactly 0.09375 per 1.33 ms step). */
     tc &= 0xffff;
-    if (!tc)
+    if (!tc || (c->glide_frames % 64) + B < 64)
         return 0.0f;
-    k = (double) tc / shift;
-    if (k >= 1.0)
-        return 1.0f;
-    return (float) (1.0 - pow(1.0 - k, B));
+    k = (double) tc * 64.0 / shift;
+    return (float) (k >= 1.0 ? 1.0 : k);
 }
 
 static void
@@ -1090,10 +1092,10 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
     c->a3d_cur_dirty[s] = 0;
 
     /* Glide current values toward the targets. */
-    float kh = glide_k(R(ba + 0x37c), 2097152.0);
-    float kg = glide_k(R(ba + 0x380), 2097152.0);
-    float kc = glide_k(R(ba + 0x384), 2097152.0);
-    float ki = glide_k(R(ba + 0x388), 524288.0);
+    float kh = glide_k(c, R(ba + 0x37c), 2097152.0);
+    float kg = glide_k(c, R(ba + 0x380), 2097152.0);
+    float kc = glide_k(c, R(ba + 0x384), 2097152.0);
+    float ki = glide_k(c, R(ba + 0x388), 524288.0);
     if (kh > 0.0f)
         for (int k = 0; k < HRTF_TAPS; k++) {
             uint32_t w = R(bb + 0x100 + k * 4);
@@ -1485,6 +1487,7 @@ v2_run_block(v2_chip_t *c, float *out)
     memset(c->kstate, 0, sizeof(c->kstate));
     c->wt_done[0] = c->wt_done[1] = 0;
     c->a3d_done = c->xt_done = c->eq_done = 0;
+    c->glide_frames += B;
     mix_ramp(c);
 
     const float *fl = gather(c, AK_CODEC + 0);
