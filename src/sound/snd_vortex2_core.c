@@ -233,6 +233,7 @@ struct v2_chip_t {
     uint32_t timer_t0;
     uint32_t timer_missed;
     uint32_t n_fired, n_acked, n_irq_raise, n_zero_timer;
+    double   lr[4][3]; /* stereo diagnostics: sum LL, RR, LR at A3D out, canceller out, EQ out, output */
     uint32_t status_frames;
 
     v2_dma_t adb[NR_ADBDMA];
@@ -1455,6 +1456,31 @@ v2_run_block(v2_chip_t *c, float *out)
     for (int bank = 0; bank < 2; bank++)
         if (!c->wt_done[bank])
             wt_bank_run(c, bank);
+    /* Stereo diagnostics: how alike left and right are at each stage. */
+    {
+        const float *sl[4] = { NULL, c->xt_done ? c->xt_out[0] : NULL, c->eq_done ? c->eq_out[0] : NULL, fl };
+        const float *sr[4] = { NULL, c->xt_done ? c->xt_out[1] : NULL, c->eq_done ? c->eq_out[1] : NULL, fr };
+        float al[B], ar[B];
+        if (c->a3d_done) {
+            memset(al, 0, sizeof(al));
+            memset(ar, 0, sizeof(ar));
+            for (int k = 0; k < 4; k++)
+                for (int n = 0; n < B; n++) {
+                    al[n] += c->a3d_out[2 * k][n];
+                    ar[n] += c->a3d_out[2 * k + 1][n];
+                }
+            sl[0] = al;
+            sr[0] = ar;
+        }
+        for (int st = 0; st < 4; st++)
+            if (sl[st])
+                for (int n = 0; n < B; n++) {
+                    c->lr[st][0] += (double) sl[st][n] * sl[st][n];
+                    c->lr[st][1] += (double) sr[st][n] * sr[st][n];
+                    c->lr[st][2] += (double) sl[st][n] * sr[st][n];
+                }
+    }
+
     /* Diagnostics: a status line every two seconds. */
     c->status_frames += B;
     if (c->host.log && c->status_frames >= 2 * V2_RATE) {
@@ -1476,7 +1502,19 @@ v2_run_block(v2_chip_t *c, float *out)
             wt_stall += c->wt[v].state == DMA_STALL;
             wt_end += c->wt[v].state == DMA_END;
         }
-        snprintf(line + n, sizeof(line) - n, " | WT run %d stall %d end %d\n", wt_run, wt_stall, wt_end);
+        n += snprintf(line + n, sizeof(line) - n, " | WT run %d stall %d end %d | L/R", wt_run, wt_stall, wt_end);
+        static const char *const stage[4] = { "a3d", "xtalk", "eq", "out" };
+        for (int st = 0; st < 4 && n < (int) sizeof(line) - 48; st++) {
+            double ll = c->lr[st][0], rr = c->lr[st][1], lr = c->lr[st][2];
+            if (ll + rr < 1e-9)
+                n += snprintf(line + n, sizeof(line) - n, " %s -", stage[st]);
+            else
+                n += snprintf(line + n, sizeof(line) - n, " %s %.0fdB corr %.2f bal %+.1f", stage[st],
+                              10.0 * log10((ll + rr) / (2.0 * 2 * V2_RATE)), lr / sqrt(ll * rr + 1e-30),
+                              10.0 * log10((rr + 1e-12) / (ll + 1e-12)));
+        }
+        snprintf(line + n, sizeof(line) - n, "\n");
+        memset(c->lr, 0, sizeof(c->lr));
         c->host.log(c->host.priv, line);
         c->status_frames = 0;
         c->n_fired = c->n_acked = c->n_irq_raise = 0;
