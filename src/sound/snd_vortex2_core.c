@@ -232,7 +232,7 @@ struct v2_chip_t {
     uint32_t timer_last;
     uint32_t timer_t0;
     uint32_t timer_missed;
-    uint32_t n_fired, n_acked, n_irq_raise;
+    uint32_t n_fired, n_acked, n_irq_raise, n_zero_timer;
     uint32_t status_frames;
 
     v2_dma_t adb[NR_ADBDMA];
@@ -1640,8 +1640,17 @@ v2_write(v2_chip_t *c, uint32_t addr, uint32_t val)
             }
             break;
         case SMP_TIMER:
-            if (!(val & 0xffff) && (c->timer_last & 0xffff))
-                v2_log(c, "Vortex2: [%9.3f] driver stopped the sample timer (wrote 0)\n", v2_now(c));
+            if (!(val & 0xffff) && (c->timer_last & 0xffff)) {
+                /* The driver computes the next period as "deadline minus
+                   now" and writes 0 when the deadline has already passed.
+                   The real card then never interrupts again (the
+                   interrupt death seen under QEMU, where the driver ran
+                   late); here a 0 fires at once instead, so the driver's
+                   handler runs and sets a fresh period. */
+                if (c->n_zero_timer++ < 20)
+                    v2_log(c, "Vortex2: [%9.3f] driver wrote 0 to the sample timer; firing at once\n", v2_now(c));
+                val = (val & ~0xffffu) | 1;
+            }
             c->timer_last  = val;
             c->timer_t0    = c->host.clock ? c->host.clock(c->host.priv) : 0;
             c->timer_fired = 0;
