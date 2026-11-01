@@ -964,8 +964,9 @@ wt_bank_run(v2_chip_t *c, int bank)
 /*                                                                     */
 /* 16 sources (4 slices x 4). Bank B per source at 0x19000 + slice *   */
 /* 0x2000 + source * 0x2c8:                                            */
-/*   +0x000 HrtfCurrent[56]  +0x100 HrtfTarget[56]: Q15 taps, low half */
-/*          left ear, high half right ear                              */
+/*   +0x000 HrtfCurrent[56]  +0x100 HrtfTarget[56]: Q15 taps; in the  */
+/*          targets low half = left ear, high half = right ear; every  */
+/*          current register has its halves the other way round        */
 /*   +0x0e0/0x0e4 Gain current/target: Q15 (16 bits)                   */
 /*   +0x0e8/0x0ec atmospheric a1 (low) / a2 (high), Q14                */
 /*   +0x0f0/0x0f4 b0 (low) / b1 (high), Q14; +0x0f8/0x0fc b2           */
@@ -987,19 +988,23 @@ a3d_load_current(v2_chip_t *c, int s)
     v2_a3d_t *a  = &c->a3d[s];
     uint32_t  bb = a3d_b(s);
 
+    /* The current registers hold their two 16-bit halves the other way
+       round from the targets (ALSA's A12/A21 and B01/B10 names hint at
+       it; the driver's start-of-sound writes confirm it for every pair). */
     for (int k = 0; k < HRTF_TAPS; k++) {
         uint32_t w = R(bb + k * 4);
-        a->h[0][k] = LO16(w) / 32768.0f;
-        a->h[1][k] = HI16(w) / 32768.0f;
+        a->h[0][k] = HI16(w) / 32768.0f;
+        a->h[1][k] = LO16(w) / 32768.0f;
     }
-    a->gain   = LO16(R(bb + 0xe0)) / 32768.0f;
-    a->co[0]  = LO16(R(bb + 0xe8)) / 16384.0f;
-    a->co[1]  = HI16(R(bb + 0xe8)) / 16384.0f;
-    a->co[2]  = LO16(R(bb + 0xf0)) / 16384.0f;
-    a->co[3]  = HI16(R(bb + 0xf0)) / 16384.0f;
-    a->co[4]  = LO16(R(bb + 0xf8)) / 16384.0f;
-    a->itd[0] = (float) (uint16_t) R(bb + 0x1e0) / 512.0f;
-    a->itd[1] = (float) (uint16_t) (R(bb + 0x1e0) >> 16) / 512.0f;
+    a->gain   = HI16(R(bb + 0xe0)) / 32768.0f;
+    a->co[0]  = HI16(R(bb + 0xe8)) / 16384.0f;
+    a->co[1]  = LO16(R(bb + 0xe8)) / 16384.0f;
+    a->co[2]  = HI16(R(bb + 0xf0)) / 16384.0f;
+    a->co[3]  = LO16(R(bb + 0xf0)) / 16384.0f;
+    a->co[4]  = HI16(R(bb + 0xf8)) / 16384.0f;
+    a->itd[0] = (float) (uint16_t) (R(bb + 0x1e0) >> 16) / 512.0f;
+    a->itd[1] = (float) (uint16_t) R(bb + 0x1e0) / 512.0f;
+    a->x1 = a->x2 = a->y1 = a->y2 = 0.0f;
     a->loaded = 1;
 }
 
@@ -1062,15 +1067,25 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
         a->itd[1] += ((float) (uint16_t) (R(bb + 0x1e4) >> 16) / 512.0f - a->itd[1]) * ki;
     }
 
-    /* Make the current values visible to the driver. */
+    /* Never let a bad coefficient set (or a glide through one) poison
+       the filter for good: an unstable pole would otherwise drive the
+       state to infinity and silence the source until it is restarted. */
+    if (!isfinite(a->y1) || !isfinite(a->y2) || fabsf(a->y1) > 64.0f || fabsf(a->y2) > 64.0f) {
+        a->x1 = a->x2 = a->y1 = a->y2 = 0.0f;
+        memset(a->dl, 0, sizeof(a->dl));
+        memset(a->fh, 0, sizeof(a->fh));
+    }
+
+    /* Make the current values visible to the driver (halves swapped, as
+       in the registers). */
     for (int k = 0; k < HRTF_TAPS; k++)
-        R(bb + k * 4) = pack16(a->h[0][k], a->h[1][k], 32768.0f);
-    R(bb + 0xe0)  = (R(bb + 0xe0) & 0xffff0000) | (uint16_t) lrintf(clampf(a->gain * 32768.0f, -32768.0f, 32767.0f));
-    R(bb + 0xe8)  = pack16(a->co[0], a->co[1], 16384.0f);
-    R(bb + 0xf0)  = pack16(a->co[2], a->co[3], 16384.0f);
-    R(bb + 0xf8)  = pack16(a->co[4], 0.0f, 16384.0f);
-    R(bb + 0x1e0) = ((uint32_t) (uint16_t) lrintf(clampf(a->itd[1] * 512.0f, 0.0f, 65535.0f)) << 16)
-        | (uint16_t) lrintf(clampf(a->itd[0] * 512.0f, 0.0f, 65535.0f));
+        R(bb + k * 4) = pack16(a->h[1][k], a->h[0][k], 32768.0f);
+    R(bb + 0xe0)  = pack16(a->gain, a->gain, 32768.0f);
+    R(bb + 0xe8)  = pack16(a->co[1], a->co[0], 16384.0f);
+    R(bb + 0xf0)  = pack16(a->co[3], a->co[2], 16384.0f);
+    R(bb + 0xf8)  = pack16(0.0f, a->co[4], 16384.0f);
+    R(bb + 0x1e0) = ((uint32_t) (uint16_t) lrintf(clampf(a->itd[0] * 512.0f, 0.0f, 65535.0f)) << 16)
+        | (uint16_t) lrintf(clampf(a->itd[1] * 512.0f, 0.0f, 65535.0f));
 
     c->dbg |= 1;
 
@@ -1312,6 +1327,8 @@ eq_run(v2_chip_t *c)
             if (g == 0.0f)
                 continue;
             float *co = c->eq.co[s][b], *st = c->eq.st[s][b];
+            if (!isfinite(st[2]) || fabsf(st[2]) > 64.0f)
+                memset(st, 0, sizeof(float) * 4); /* recover from an unstable coefficient set */
             for (int n = 0; n < B; n++) {
                 float y = co[2] * x[n] + co[3] * st[0] + co[4] * st[1] + co[0] * st[2] + co[1] * st[3];
                 st[1]   = st[0];
