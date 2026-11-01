@@ -251,6 +251,7 @@ struct v2_chip_t {
     v2_wtv_t wtv[NR_WTDMA];
     v2_a3d_t a3d[NR_A3D];
     uint8_t  a3d_cur_dirty[NR_A3D];
+    uint8_t  a3d_used[NR_A3D];
 
     int     xt_dirty;
     v2_xt_t xt;
@@ -1034,6 +1035,7 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
 
     if (!a->loaded || c->a3d_cur_dirty[s])
         a3d_load_current(c, s);
+    c->a3d_used[s] = 1;
     c->a3d_cur_dirty[s] = 0;
 
     /* Glide current values toward the targets. */
@@ -1513,6 +1515,27 @@ v2_run_block(v2_chip_t *c, float *out)
                               10.0 * log10((ll + rr) / (2.0 * 2 * V2_RATE)), lr / sqrt(ll * rr + 1e-30),
                               10.0 * log10((rr + 1e-12) / (ll + 1e-12)));
         }
+        /* Active 3D sources: glide-rate words (bank A) and the left/right
+           level difference of the HRTF target versus the filter in use. */
+        for (int sl = 0; sl < NR_A3D && n < (int) sizeof(line) - 96; sl++) {
+            v2_a3d_t *a = &c->a3d[sl];
+            if (!a->loaded || !c->a3d_used[sl])
+                continue;
+            uint32_t bb = a3d_b(sl), ba = a3d_a(sl);
+            double tl = 0, tr = 0, cl = 0, cr = 0;
+            for (int k = 0; k < HRTF_TAPS; k++) {
+                uint32_t w = R(bb + 0x100 + k * 4);
+                tl += (double) LO16(w) * LO16(w);
+                tr += (double) HI16(w) * HI16(w);
+                cl += (double) a->h[0][k] * a->h[0][k];
+                cr += (double) a->h[1][k] * a->h[1][k];
+            }
+            n += snprintf(line + n, sizeof(line) - n, " | S%d tc %x/%x/%x/%x ild tgt %+.1f cur %+.1f gain %.2f",
+                          sl, R(ba + 0x37c) & 0xffff, R(ba + 0x380) & 0xffff, R(ba + 0x384) & 0xffff,
+                          R(ba + 0x388) & 0xffff, 10.0 * log10((tr + 1e-9) / (tl + 1e-9)),
+                          10.0 * log10((cr + 1e-12) / (cl + 1e-12)), a->gain);
+        }
+        memset(c->a3d_used, 0, sizeof(c->a3d_used));
         snprintf(line + n, sizeof(line) - n, "\n");
         memset(c->lr, 0, sizeof(c->lr));
         c->host.log(c->host.priv, line);
