@@ -167,6 +167,7 @@ typedef struct v2_dma_t {
     float    frame[FRAME_RING][4]; /* recent frames, shared by the routes reading them */
     uint32_t frame_no;
     uint32_t rate_acc; /* capture: phase accumulator (16.16) */
+    uint32_t since_fetch; /* samples taken from the FIFO since the last fetch */
 } v2_dma_t;
 
 typedef struct v2_route_t {
@@ -539,6 +540,7 @@ dma_fill(v2_chip_t *c, v2_dma_t *d, uint32_t need)
             d->fifo[(d->frd + d->fn + i) & (FIFO_LEN - 1)] = tmp[i];
         d->fn += n;
         d->pos += n;
+        d->since_fetch = 0;
         if (d->pos >= size)
             dma_page_end(c, d);
         guard = 8;
@@ -616,6 +618,7 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
         }
         fr[i] = v;
     }
+    d->since_fetch += nch;
     d->frame_no++;
 }
 
@@ -676,7 +679,10 @@ dma_put_frame(v2_chip_t *c, v2_dma_t *d, const float *v, int nch)
 static uint32_t
 dma_stat(v2_chip_t *c, v2_dma_t *d)
 {
-    uint32_t v = ((uint32_t) d->page << 12) | (d->pos & 0xfff);
+    /* bits 19-14: samples played from the FIFO since its last fetch
+       (the real card fetches 18 samples whenever that many have been
+       played, so the field climbs 3..17 and drops) */
+    uint32_t v = ((uint32_t) d->page << 12) | (d->pos & 0xfff) | ((d->since_fetch > 0x3f ? 0x3f : d->since_fetch) << 14);
 
     (void) c;
     switch (d->state) {
@@ -684,7 +690,7 @@ dma_stat(v2_chip_t *c, v2_dma_t *d)
         case DMA_STALL:
             return v | 0x00200000;
         case DMA_END:
-            return v | 0x00040000; /* stream finished: neither run (0x200000) nor idle (0x500000) */
+            return v; /* stream finished: neither run (0x200000) nor idle (0x500000), e.g. 0x51000 */
         default:
             return v | 0x00500000;
     }

@@ -40,6 +40,8 @@
 #include <86box/sound.h>
 #include <86box/snd_ac97.h>
 #include <86box/plat_unused.h>
+#include <86box/plat.h>
+#include <86box/path.h>
 
 #include "snd_vortex2_core.h"
 
@@ -71,6 +73,7 @@ typedef struct vortex2_t {
 
     int   rear_mix;
     int   log_routes;
+    FILE *logf;
     float out[V2_BLOCK * 4];
 
     int16_t ring[V2_BLOCK * 8 * 2];
@@ -179,8 +182,10 @@ host_log(void *priv, const char *msg)
 {
     const vortex2_t *dev = (vortex2_t *) priv;
 
-    if (dev->log_routes)
-        always_log("%s", msg); /* release builds compile pclog() out */
+    if (dev->log_routes && dev->logf) {
+        fputs(msg, dev->logf);
+        fflush(dev->logf);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -571,7 +576,17 @@ vortex2_init(UNUSED(const device_t *info))
 
     dev->rear_mix   = device_get_config_int("rear_mix");
     dev->log_routes = device_get_config_int("log");
-    always_log("Vortex2: card added, diagnostic log %s\n", dev->log_routes ? "on" : "off");
+    if (dev->log_routes) {
+        /* Its own file in the machine's folder, so it works in release
+           builds and without command-line options. */
+        char fn[1024];
+        path_append_filename(fn, usr_path, "vortex2.log");
+        dev->logf = plat_fopen(fn, "w");
+        if (dev->logf) {
+            fprintf(dev->logf, "Vortex2: card added, diagnostic log on\n");
+            fflush(dev->logf);
+        }
+    }
 
     memset(&host, 0, sizeof(host));
     host.priv        = dev;
@@ -618,6 +633,8 @@ vortex2_close(void *priv)
     vortex2_t *dev = (vortex2_t *) priv;
 
     v2_destroy(dev->chip);
+    if (dev->logf)
+        fclose(dev->logf);
     free(dev);
 }
 
