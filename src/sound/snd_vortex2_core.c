@@ -231,6 +231,8 @@ struct v2_chip_t {
     uint32_t timer_last;
     uint32_t timer_t0;
     uint32_t timer_missed;
+    uint32_t n_fired, n_acked, n_irq_raise;
+    uint32_t status_frames;
 
     v2_dma_t adb[NR_ADBDMA];
     v2_dma_t wt[NR_WTDMA];
@@ -349,6 +351,8 @@ update_irq(v2_chip_t *c)
 
     if (level != c->irq_level) {
         c->irq_level = level;
+        if (level)
+            c->n_irq_raise++;
         if (c->host.set_irq)
             c->host.set_irq(c->host.priv, level);
     }
@@ -370,6 +374,7 @@ v2_timer_expired(v2_chip_t *c)
                    v2_now(c), R(IRQ_CTRL), R(CHIP_CTRL));
     } else
         c->timer_missed = 0;
+    c->n_fired++;
     c->timer_fired = 1;
     raise_irq(c, IRQ_TIMER);
 }
@@ -1462,6 +1467,33 @@ v2_run_block(v2_chip_t *c, float *out)
     for (int bank = 0; bank < 2; bank++)
         if (!c->wt_done[bank])
             wt_bank_run(c, bank);
+    /* Diagnostics: a status line every two seconds. */
+    c->status_frames += B;
+    if (c->host.log && c->status_frames >= 2 * V2_RATE) {
+        char line[1024];
+        int  n = snprintf(line, sizeof(line), "Vortex2: [%9.3f] status: timer %u fired %u acked %u irq-raises %u level %d src %04x mask %08x ctrl %08x |",
+                          v2_now(c), c->timer_last & 0xffff, c->n_fired, c->n_acked, c->n_irq_raise, c->irq_level,
+                          c->irq_src, R(IRQ_CTRL), R(CHIP_CTRL));
+        for (int ch = 0; ch < NR_ADBDMA && n < (int) sizeof(line) - 64; ch++) {
+            v2_dma_t *d = &c->adb[ch];
+            if (d->state == DMA_IDLE)
+                continue;
+            n += snprintf(line + n, sizeof(line) - n, " A%d:%c%d/%03x %02x%02x",
+                          ch, "IRSE"[d->state], d->page, d->pos & 0xfff,
+                          R(dma_cfg(d)) >> 24, R(dma_cfg(d) + 4) >> 24);
+        }
+        int wt_run = 0, wt_stall = 0, wt_end = 0;
+        for (int v = 0; v < NR_WTDMA; v++) {
+            wt_run += c->wt[v].state == DMA_RUN;
+            wt_stall += c->wt[v].state == DMA_STALL;
+            wt_end += c->wt[v].state == DMA_END;
+        }
+        snprintf(line + n, sizeof(line) - n, " | WT run %d stall %d end %d\n", wt_run, wt_stall, wt_end);
+        c->host.log(c->host.priv, line);
+        c->status_frames = 0;
+        c->n_fired = c->n_acked = c->n_irq_raise = 0;
+    }
+
     /* Playback DMA channels with no consumer at all still drain. */
     for (int ch = 0; ch < NR_ADBDMA; ch++) {
         v2_dma_t *d = &c->adb[ch];
@@ -1513,6 +1545,7 @@ v2_read(v2_chip_t *c, uint32_t addr)
                 v |= n - el;
             }
             c->timer_fired = 0;
+            c->n_acked++;
             c->irq_src &= ~IRQ_TIMER;
             update_irq(c);
             break;

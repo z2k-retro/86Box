@@ -571,6 +571,7 @@ vortex2_init(UNUSED(const device_t *info))
 
     dev->rear_mix   = device_get_config_int("rear_mix");
     dev->log_routes = device_get_config_int("log");
+    always_log("Vortex2: card added, diagnostic log %s\n", dev->log_routes ? "on" : "off");
 
     memset(&host, 0, sizeof(host));
     host.priv        = dev;
@@ -635,10 +636,10 @@ static const device_config_t vortex2_config[] = {
     },
     {
         .name           = "log",
-        .description    = "Log routing and canceller changes",
+        .description    = "Diagnostic log (status every 2 s, stream events)",
         .type           = CONFIG_BINARY,
         .default_string = NULL,
-        .default_int    = 0,
+        .default_int    = 1,
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = { { 0 } },
