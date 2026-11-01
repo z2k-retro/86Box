@@ -253,6 +253,7 @@ struct v2_chip_t {
     uint8_t  a3d_cur_dirty[NR_A3D];
     uint8_t  a3d_used[NR_A3D];
     uint32_t graph_hash;
+    uint32_t wt_routed[2]; /* voices whose own ADB source is routed somewhere */
 
     int     xt_dirty;
     v2_xt_t xt;
@@ -766,6 +767,7 @@ graph_rebuild(v2_chip_t *c)
     uint32_t sr = R(ADB_SR);
 
     c->nroutes = 0;
+    c->wt_routed[0] = c->wt_routed[1] = 0;
     memset(c->sink_n, 0, sizeof(c->sink_n));
     memset(c->dma_nroutes, 0, sizeof(c->dma_nroutes));
 
@@ -794,6 +796,13 @@ graph_rebuild(v2_chip_t *c)
         }
     }
     c->graph_dirty = 0;
+    for (int r = 0; r < c->nroutes; r++) {
+        int src = c->route[r].src;
+        if (src >= AS_WT0 && src < AS_WT0 + 32)
+            c->wt_routed[0] |= 1u << (src - AS_WT0);
+        else if (src >= AS_WT1 && src < AS_WT1 + 32)
+            c->wt_routed[1] |= 1u << (src - AS_WT1);
+    }
     v2_log(c, "Vortex2: routing rebuilt, %d routes (ADB_SR %06x)\n", c->nroutes, sr);
     graph_dump(c);
 }
@@ -928,10 +937,9 @@ mix_run(v2_chip_t *c, int m, float *out)
 /*   bits 15-0   rate: e = bits 15-13, m = bits 12-0,                  */
 /*               rate = 48 kHz * 2^(e-5) * (1 + m/8192)  (confirmed     */
 /*               against measured DMA consumption)                     */
-/* A voice with its DSREG bit set feeds its own ADB source address     */
-/* (bank base + voice), which the driver routes to an A3D input when   */
-/* it runs out of ADB channels. Otherwise PARM0's gain sends it to     */
-/* the bank's mixed output 32 and PARM1's to 33.                       */
+/* A voice whose own ADB source address (bank base + voice) is routed   */
+/* (the driver routes them to A3D inputs) feeds that source; otherwise */
+/* PARM0's gain sends it to the bank's mixed output 32, PARM1's to 33. */
 /* ------------------------------------------------------------------ */
 
 static inline float
@@ -945,7 +953,11 @@ static void
 wt_bank_run(v2_chip_t *c, int bank)
 {
     uint32_t bb = bank * WT_BANK_STRIDE;
-    uint32_t ds = R(bb + WT_DSREG);
+    /* A voice goes to its own ADB source when the routing table uses that
+       source, and then not to the mixed outputs: in A3D mode the Windows
+       driver routes voices to 3D inputs at unity gain while DSREG stays 0,
+       so DSREG is not what selects this. */
+    uint32_t ds = R(bb + WT_DSREG) | c->wt_routed[bank];
 
     memset(c->wt_direct[bank], 0, sizeof(c->wt_direct[bank]));
     memset(c->wt_bus[bank], 0, sizeof(c->wt_bus[bank]));
