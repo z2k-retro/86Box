@@ -410,12 +410,29 @@ dma_bps(int fmt)
     return (fmt == 1 || fmt == 2 || fmt == 3) ? 1 : 2;
 }
 
+static double
+v2_now(v2_chip_t *c)
+{
+    return c->host.clock ? (double) c->host.clock(c->host.priv) / 12288000.0 : 0.0;
+}
+
+static void
+dma_log_state(v2_chip_t *c, v2_dma_t *d, const char *what)
+{
+    if (d->is_wt)
+        return; /* wavetable one-shots end all the time */
+    v2_log(c, "Vortex2: [%9.3f] ADB DMA %2d %s, page %d pos %03x, cfg %08x %08x, ctrl %08x\n",
+           v2_now(c), d->ch, what, d->page, d->pos, R(dma_cfg(d)), R(dma_cfg(d) + 4), R(dma_ctrl(d)));
+}
+
 static void
 dma_enter_page(v2_chip_t *c, v2_dma_t *d, int page)
 {
     d->page  = page & 3;
     d->pos   = 0;
     d->state = (dma_nibble(c, d, d->page) & 8) ? DMA_RUN : DMA_STALL;
+    if (d->state == DMA_STALL)
+        dma_log_state(c, d, "stalled (next page has no data)");
 }
 
 static void
@@ -429,6 +446,7 @@ dma_page_end(v2_chip_t *c, v2_dma_t *d)
         dma_enter_page(c, d, nib & 3);
     else {
         d->state = DMA_END;
+        dma_log_state(c, d, "ended (page without carry-on)");
         /* The card drops the FIFO's run bits when a stream ends (seen as
            0x42070 -> 0x2680 in the DOS Sound Blaster trace). */
         R(dma_fifo(d)) &= ~(FIFO_VALID | FIFO_U1);
@@ -450,6 +468,7 @@ dma_begin(v2_chip_t *c, v2_dma_t *d)
     d->pos   = R(dma_ctrl(d)) & 0xfff;
     d->state = DMA_RUN;
     nib      = dma_nibble(c, d, d->page);
+    dma_log_state(c, d, "started");
     if (!(nib & 8)) {
         /* Start page without data: treat it as already played. The
            Windows wavetable path starts on such a page linked to the
@@ -469,10 +488,22 @@ dma_fill(v2_chip_t *c, v2_dma_t *d, uint32_t need)
     int     guard = 8;
 
     while (d->fn < need && guard-- > 0) {
+        if (d->state == DMA_END) {
+            /* Robustness: if the driver links the finished page after
+               all (it was late), carry on instead of staying silent. */
+            int nib = dma_nibble(c, d, d->page);
+            if (!(nib & 4))
+                return;
+            R(dma_fifo(d)) |= FIFO_VALID | FIFO_U1;
+            dma_enter_page(c, d, nib & 3);
+            dma_log_state(c, d, "resumed after late carry-on");
+            continue;
+        }
         if (d->state == DMA_STALL) {
-            if (dma_nibble(c, d, d->page) & 8)
+            if (dma_nibble(c, d, d->page) & 8) {
                 d->state = DMA_RUN;
-            else
+                dma_log_state(c, d, "resumed");
+            } else
                 return;
         }
         if (d->state != DMA_RUN)
