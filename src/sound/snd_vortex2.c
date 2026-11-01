@@ -180,7 +180,7 @@ host_log(void *priv, const char *msg)
     const vortex2_t *dev = (vortex2_t *) priv;
 
     if (dev->log_routes)
-        pclog("%s", msg);
+        always_log("%s", msg); /* release builds compile pclog() out */
 }
 
 /* ------------------------------------------------------------------ */
@@ -627,7 +627,7 @@ static const device_config_t vortex2_config[] = {
         .description    = "Mix rear channels into the stereo output",
         .type           = CONFIG_BINARY,
         .default_string = NULL,
-        .default_int    = 1,
+        .default_int    = 0,
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = { { 0 } },

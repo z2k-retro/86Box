@@ -147,6 +147,7 @@
 #define HRTF_TAPS  56
 #define ITD_LEN    128 /* delay line, power of two */
 #define FIFO_LEN   512
+#define FRAME_RING 512 /* frames kept per DMA channel: covers a block at the highest ratio */
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
@@ -163,7 +164,7 @@ typedef struct v2_dma_t {
     uint32_t pos;     /* byte offset in the current page */
     uint8_t  fifo[FIFO_LEN];
     uint32_t frd, fn;
-    float    frame[4]; /* last frame fetched, shared by the routes reading it */
+    float    frame[FRAME_RING][4]; /* recent frames, shared by the routes reading them */
     uint32_t frame_no;
     uint32_t rate_acc; /* capture: phase accumulator (16.16) */
 } v2_dma_t;
@@ -463,7 +464,6 @@ dma_begin(v2_chip_t *c, v2_dma_t *d)
     d->fn       = 0;
     d->frame_no = 0;
     d->rate_acc = 0;
-    memset(d->frame, 0, sizeof(d->frame));
     d->page  = (R(dma_start(d)) >> ((15 - (d->ch & 15)) * 2)) & 3;
     d->pos   = R(dma_ctrl(d)) & 0xfff;
     d->state = DMA_RUN;
@@ -573,6 +573,8 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
     int fmt = dma_fmt(c, d);
     int bps = dma_bps(fmt);
 
+    float *fr = d->frame[d->frame_no & (FRAME_RING - 1)];
+
     if (nch < 1)
         nch = 1;
     if (nch > 4)
@@ -581,7 +583,7 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
         dma_fill(c, d, 64);
     if (d->fn < (uint32_t) (nch * bps)) {
         for (int i = 0; i < 4; i++)
-            d->frame[i] = 0.0f; /* underrun */
+            fr[i] = 0.0f; /* underrun */
         d->frame_no++;
         return;
     }
@@ -598,25 +600,31 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
             uint8_t hi = fifo_pop(d);
             v          = (float) (int16_t) (lo | (hi << 8)) / 32768.0f;
         }
-        d->frame[i] = v;
+        fr[i] = v;
     }
     d->frame_no++;
 }
 
 /* A consumer (route, converter, voice) takes sample idx of its next
-   frame; consumers reading the same channel in lockstep share frames. */
+   frame. Each frame is fetched once; the consumers of one channel (the
+   left and right converters of a stereo stream) each read it in turn,
+   even though the model runs them a block apart. */
 static float
 dma_take(v2_chip_t *c, v2_dma_t *d, int idx, int nch, uint32_t *cnt)
 {
+    float v;
+
     if (d->state == DMA_IDLE)
         return 0.0f;
-    if (*cnt >= d->frame_no || *cnt + 1 < d->frame_no) {
-        if (*cnt + 1 < d->frame_no)
-            *cnt = d->frame_no; /* fell behind: resynchronise */
+    if (d->frame_no - *cnt > FRAME_RING - 1 && *cnt < d->frame_no)
+        *cnt = d->frame_no - 1; /* fell too far behind: resynchronise */
+    if (*cnt > d->frame_no)
+        *cnt = d->frame_no;
+    if (*cnt == d->frame_no)
         dma_next_frame(c, d, nch);
-    }
+    v = d->frame[*cnt & (FRAME_RING - 1)][idx & 3];
     (*cnt)++;
-    return d->frame[idx & 3];
+    return v;
 }
 
 /* Capture: write one frame to guest memory. */
