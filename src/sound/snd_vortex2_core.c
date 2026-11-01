@@ -230,6 +230,7 @@ struct v2_chip_t {
     int      timer_fired;
     uint32_t timer_last;
     uint32_t timer_t0;
+    uint32_t timer_missed;
 
     v2_dma_t adb[NR_ADBDMA];
     v2_dma_t wt[NR_WTDMA];
@@ -339,6 +340,8 @@ init_tables(void)
 /* Interrupts                                                          */
 /* ------------------------------------------------------------------ */
 
+static double v2_now(v2_chip_t *c);
+
 static void
 update_irq(v2_chip_t *c)
 {
@@ -361,6 +364,12 @@ raise_irq(v2_chip_t *c, uint32_t bits)
 void
 v2_timer_expired(v2_chip_t *c)
 {
+    if (c->timer_fired) {
+        if (++c->timer_missed == 50)
+            v2_log(c, "Vortex2: [%9.3f] timer interrupts not being serviced (IRQ_CTRL %08x CTRL %08x)\n",
+                   v2_now(c), R(IRQ_CTRL), R(CHIP_CTRL));
+    } else
+        c->timer_missed = 0;
     c->timer_fired = 1;
     raise_irq(c, IRQ_TIMER);
 }
@@ -1575,6 +1584,8 @@ v2_write(v2_chip_t *c, uint32_t addr, uint32_t val)
             }
             break;
         case SMP_TIMER:
+            if (!(val & 0xffff) && (c->timer_last & 0xffff))
+                v2_log(c, "Vortex2: [%9.3f] driver stopped the sample timer (wrote 0)\n", v2_now(c));
             c->timer_last  = val;
             c->timer_t0    = c->host.clock ? c->host.clock(c->host.priv) : 0;
             c->timer_fired = 0;
