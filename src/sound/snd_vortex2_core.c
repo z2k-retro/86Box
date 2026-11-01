@@ -965,8 +965,10 @@ wt_bank_run(v2_chip_t *c, int bank)
 /*          left ear, high half right ear                              */
 /* Bank A (0x18000 + slice * 0x2000 + source * 0x3a4) +0x37c..0x388    */
 /* hold the glide time constants (HRTF, gain, filter, ITD): current    */
-/* values approach targets with tau = 2^21 / TC samples. The ITD       */
-/* glides faster than that rule; 2^18 / TC is a working guess.         */
+/* values approach targets exponentially with tau = 2^21 / TC samples */
+/* for gain, filter and HRTF, and 2^19 / TC for the ITD (fitted to a   */
+/* sweep of all four TC words on real hardware; HRTF may be nearer     */
+/* 2^20.5 and is still to be read back directly).                      */
 /* Outputs: slice s left/right = ADB sources A3DOUT(2s)/(2s+1).        */
 /* ------------------------------------------------------------------ */
 
@@ -1037,7 +1039,7 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
     float kh = glide_k(R(ba + 0x37c), 2097152.0);
     float kg = glide_k(R(ba + 0x380), 2097152.0);
     float kc = glide_k(R(ba + 0x384), 2097152.0);
-    float ki = glide_k(R(ba + 0x388), 262144.0);
+    float ki = glide_k(R(ba + 0x388), 524288.0);
     if (kh > 0.0f)
         for (int k = 0; k < HRTF_TAPS; k++) {
             uint32_t w = R(bb + 0x100 + k * 4);
