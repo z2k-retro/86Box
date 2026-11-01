@@ -385,13 +385,16 @@ v2_timer_expired(v2_chip_t *c)
 /*                                                                     */
 /* Each channel has four page addresses and two configuration words.   */
 /* Per page: a 12-bit size (bytes - 1) and a nibble:                   */
-/*   bit 3  page holds data                                            */
+/*   bit 3  meaning unknown (not needed to play the page)              */
 /*   bit 2  carry on to the next page when this one is done            */
 /*   bits 1-0  next page                                               */
-/* (Decoded from the Windows driver's streaming patterns and its DOS   */
-/* Sound Blaster emulation, which plays one page and stops.) A page    */
-/* with no "carry on" ends the stream; carrying on to a page without   */
-/* data stalls until the driver marks it.                              */
+/* Playback starts at the page named in the START register, plays each */
+/* page reached, and ends after a page without "carry on". Streaming   */
+/* drivers keep the page they have not refilled yet as the one without */
+/* "carry on"; one-shot sounds (DOS Sound Blaster blocks, wavetable    */
+/* voices) end on purpose. Decoded from the Windows driver's traces: a */
+/* wavetable voice started on page 1 = 0x4, page 0 = 0xe, page 2 = 0x7 */
+/* was seen playing page 2.                                            */
 /* ------------------------------------------------------------------ */
 
 static inline uint32_t dma_base(const v2_dma_t *d) { return (d->is_wt ? WTDMA_BUFBASE : ADBDMA_BUFBASE) + d->ch * 0x10; }
@@ -446,9 +449,7 @@ dma_enter_page(v2_chip_t *c, v2_dma_t *d, int page)
 {
     d->page  = page & 3;
     d->pos   = 0;
-    d->state = (dma_nibble(c, d, d->page) & 8) ? DMA_RUN : DMA_STALL;
-    if (d->state == DMA_STALL)
-        dma_log_state(c, d, "stalled (next page has no data)");
+    d->state = DMA_RUN;
 }
 
 static void
@@ -472,8 +473,6 @@ dma_page_end(v2_chip_t *c, v2_dma_t *d)
 static void
 dma_begin(v2_chip_t *c, v2_dma_t *d)
 {
-    int nib;
-
     d->touched  = 1;
     d->frd      = 0;
     d->fn       = 0;
@@ -482,17 +481,7 @@ dma_begin(v2_chip_t *c, v2_dma_t *d)
     d->page  = (R(dma_start(d)) >> ((15 - (d->ch & 15)) * 2)) & 3;
     d->pos   = R(dma_ctrl(d)) & 0xfff;
     d->state = DMA_RUN;
-    nib      = dma_nibble(c, d, d->page);
     dma_log_state(c, d, "started");
-    if (!(nib & 8)) {
-        /* Start page without data: treat it as already played. The
-           Windows wavetable path starts on such a page linked to the
-           first real one. */
-        if (nib & 4)
-            dma_enter_page(c, d, nib & 3);
-        else
-            d->state = DMA_STALL;
-    }
 }
 
 /* Pull bytes from guest memory into the FIFO until it holds `need`. */
@@ -513,13 +502,6 @@ dma_fill(v2_chip_t *c, v2_dma_t *d, uint32_t need)
             dma_enter_page(c, d, nib & 3);
             dma_log_state(c, d, "resumed after late carry-on");
             continue;
-        }
-        if (d->state == DMA_STALL) {
-            if (dma_nibble(c, d, d->page) & 8) {
-                d->state = DMA_RUN;
-                dma_log_state(c, d, "resumed");
-            } else
-                return;
         }
         if (d->state != DMA_RUN)
             return;
@@ -653,8 +635,6 @@ dma_put_frame(v2_chip_t *c, v2_dma_t *d, const float *v, int nch)
     int     bps = dma_bps(fmt);
     int     n   = 0;
 
-    if (d->state == DMA_STALL && (dma_nibble(c, d, d->page) & 8))
-        d->state = DMA_RUN;
     if (d->state != DMA_RUN)
         return;
     for (int i = 0; i < nch; i++) {
@@ -692,7 +672,7 @@ dma_stat(v2_chip_t *c, v2_dma_t *d)
         case DMA_END:
             return v; /* stream finished: neither run (0x200000) nor idle (0x500000), e.g. 0x51000 */
         default:
-            return v | 0x00500000;
+            return 0x00500000 | ((uint32_t) d->page << 12); /* idle: page only */
     }
 }
 
