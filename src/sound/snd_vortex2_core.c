@@ -252,6 +252,7 @@ struct v2_chip_t {
     v2_a3d_t a3d[NR_A3D];
     uint8_t  a3d_cur_dirty[NR_A3D];
     uint8_t  a3d_used[NR_A3D];
+    uint32_t graph_hash;
 
     int     xt_dirty;
     v2_xt_t xt;
@@ -722,6 +723,43 @@ fifo_ctrl_write(v2_chip_t *c, v2_dma_t *d, uint32_t old, uint32_t val)
 /* Routing graph                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Diagnostics: the routing table (source > sink, ADB addresses in hex)
+   and every enabled mixer input with its volume byte, logged when either
+   changes. */
+static void
+graph_dump(v2_chip_t *c)
+{
+    char     line[4096];
+    int      n = 0;
+    uint32_t h = 2166136261u;
+
+    n += snprintf(line + n, sizeof(line) - n, "Vortex2: routes:");
+    for (int r = 0; r < c->nroutes && n < (int) sizeof(line) - 16; r++) {
+        n += snprintf(line + n, sizeof(line) - n, " %02x>%02x", c->route[r].src, c->route[r].sink);
+        h = (h ^ (uint32_t) (c->route[r].src << 8 | c->route[r].sink)) * 16777619u;
+    }
+    n += snprintf(line + n, sizeof(line) - n, " | mixers:");
+    for (int m = 0; m < NR_MIXOUT && n < (int) sizeof(line) - 64; m++) {
+        int any = 0;
+        for (int i = 0; i < NR_MIXIN && n < (int) sizeof(line) - 24; i++) {
+            if (!(R(MIX_ENIN + ((m << 3) + (i >> 2)) * 4) & (1u << (i & 3))))
+                continue;
+            uint32_t g = R(MIX_INVOL_A + ((m << 5) + i) * 4) & 0xff;
+            n += snprintf(line + n, sizeof(line) - n, "%s%d<%d:%02x", any ? "," : " m", m, i, g);
+            h = (h ^ (uint32_t) (m << 16 | i << 8 | g)) * 16777619u;
+            any = 1;
+        }
+        if (any)
+            n += snprintf(line + n, sizeof(line) - n, " out:%02x", R(MIX_VOL_A + m * 4) & 0xff);
+    }
+    if (h == c->graph_hash)
+        return;
+    c->graph_hash = h;
+    snprintf(line + n, sizeof(line) - n, "\n");
+    if (c->host.log)
+        c->host.log(c->host.priv, line);
+}
+
 static void
 graph_rebuild(v2_chip_t *c)
 {
@@ -757,6 +795,7 @@ graph_rebuild(v2_chip_t *c)
     }
     c->graph_dirty = 0;
     v2_log(c, "Vortex2: routing rebuilt, %d routes (ADB_SR %06x)\n", c->nroutes, sr);
+    graph_dump(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1539,6 +1578,7 @@ v2_run_block(v2_chip_t *c, float *out)
         snprintf(line + n, sizeof(line) - n, "\n");
         memset(c->lr, 0, sizeof(c->lr));
         c->host.log(c->host.priv, line);
+        graph_dump(c);
         c->status_frames = 0;
         c->n_fired = c->n_acked = c->n_irq_raise = 0;
     }
