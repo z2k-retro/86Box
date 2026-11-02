@@ -746,7 +746,14 @@ dma_stat(v2_chip_t *c, v2_dma_t *d)
         case DMA_STALL:
             return v | 0x00200000;
         case DMA_END:
-            return v; /* stream finished: neither run (0x200000) nor idle (0x500000), e.g. 0x51000 */
+            /* Stream finished. While the FIFO still drains, the card reports
+               neither run nor idle, with the position cleared (0x000b1000);
+               once it is empty it reports idle (0x00501000), and the driver
+               waits for that before it returns the buffer to Windows. A model
+               that never went idle left system sounds stuck "playing". */
+            if (d->fn > 0)
+                return ((uint32_t) d->page << 12) | ((d->since_fetch > 0x3f ? 0x3f : d->since_fetch) << 14);
+            return 0x00500000 | ((uint32_t) d->page << 12);
         default:
             return 0x00500000 | ((uint32_t) d->page << 12); /* idle: page only */
     }
