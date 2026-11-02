@@ -2,8 +2,8 @@ name: PowerVR PCX build (Windows)
 
 # Release builds of the powervr-pcx branch for testers: the regular preset
 # (optimised, no development-branch devices) with 86Box's default dynamic
-# recompiler, plus a build with the new one (-NDR) for comparison. Pushing a tag named pcx-*, or publishing a release with such a
-# tag on GitHub, attaches the zips to that release.
+# recompiler, plus a build with the new one (-NDR) for comparison. Pushing a tag named pcx-* or vortex-*, or publishing a
+# release with such a tag on GitHub, attaches the zips to that release (creating it if it does not exist yet).
 
 on:
   push:
@@ -13,6 +13,7 @@ on:
       - vortex2
     tags:
       - 'pcx-*'
+      - 'vortex-*'
   release:
     types: [published]
   workflow_dispatch:
@@ -103,7 +104,7 @@ jobs:
           path: build/artifacts/**
 
       - name: Publish release (tags only)
-        if: startsWith(github.ref, 'refs/tags/pcx-')
+        if: startsWith(github.ref, 'refs/tags/pcx-') || startsWith(github.ref, 'refs/tags/vortex-')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
