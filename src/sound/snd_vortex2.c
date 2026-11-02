@@ -240,6 +240,10 @@ vortex2_block(void *priv)
     for (int n = 0; n < V2_BLOCK; n++) {
         float l = dev->out[n * 4 + 0] + dev->out[n * 4 + 2] * rl;
         float r = dev->out[n * 4 + 1] + dev->out[n * 4 + 3] * rr;
+        /* The chip's output saturates at digital full scale before the
+           codec's volume (run 12: summed tones clip at full scale). */
+        l = (l > 1.0f) ? 1.0f : ((l < -1.0f) ? -1.0f : l);
+        r = (r > 1.0f) ? 1.0f : ((r < -1.0f) ? -1.0f : r);
         int   w = (dev->ring_rd + dev->ring_n) % (V2_BLOCK * 8);
         if (dev->ring_n >= V2_BLOCK * 8) { /* consumer stalled: drop the oldest */
             dev->ring_rd = (dev->ring_rd + 1) % (V2_BLOCK * 8);

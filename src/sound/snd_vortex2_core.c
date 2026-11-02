@@ -175,9 +175,12 @@ typedef struct v2_route_t {
     uint32_t cnt; /* frames this route has taken from a DMA source */
 } v2_route_t;
 
+#define SRC_TAPS   22  /* converter FIR length in input samples */
+#define SRC_PHASES 256
+
 typedef struct v2_src_t {
     double   phase;
-    float    hist[4];
+    float    hist[SRC_TAPS];
     uint32_t nin;
 } v2_src_t;
 
@@ -254,6 +257,8 @@ struct v2_chip_t {
     uint8_t  a3d_used[NR_A3D];
     uint32_t graph_hash;
     uint32_t glide_frames; /* sample count for the 64-sample glide tick */
+    uint32_t log_clk_last; /* log clock: last 32-bit reading, and the wraps so far */
+    uint64_t log_clk_wraps;
     uint32_t wt_routed[2]; /* voices whose own ADB source is routed somewhere */
 
     int     xt_dirty;
@@ -319,6 +324,61 @@ interp4(const float *h, float t)
     return ((c3 * t + c2) * t + c1) * t + h[1];
 }
 
+/* Sample-rate converter filter. Measured on a real SQ2500 (run 12, noise
+   at 8-44.1 kHz against 48 kHz): flat to 0.45 x the input rate, -3 dB at
+   0.48, -6 dB at 0.50, -11 dB at 0.52, -23 dB at 0.55, -37 dB at 0.57 and
+   below the recording's noise floor (about -60 dB) from 0.60. A 22-tap
+   Kaiser-windowed sinc (beta 6, cutoff at the input Nyquist) matches that
+   to within the measurement scatter. src_fir[p] holds the taps for a
+   fractional position p / SRC_PHASES between hist[10] and hist[11]. */
+static float src_fir[SRC_PHASES + 1][SRC_TAPS];
+
+static double
+bessel_i0(double x)
+{
+    double s = 1.0, t = 1.0;
+    for (int k = 1; k < 30; k++) {
+        t *= (x / (2.0 * k)) * (x / (2.0 * k));
+        s += t;
+    }
+    return s;
+}
+
+static void
+init_src_fir(void)
+{
+    const double half = SRC_TAPS / 2.0, beta = 6.0, i0b = bessel_i0(beta);
+
+    for (int p = 0; p <= SRC_PHASES; p++) {
+        double t = (double) p / SRC_PHASES, sum = 0.0, h[SRC_TAPS];
+        for (int k = 0; k < SRC_TAPS; k++) {
+            double x = (double) k - (half - 1.0) - t; /* distance from the output point */
+            double w = x / half;
+            double v = (fabs(x) < 1e-9) ? 1.0 : sin(M_PI * x) / (M_PI * x);
+            v *= (fabs(w) < 1.0) ? bessel_i0(beta * sqrt(1.0 - w * w)) / i0b : 0.0;
+            h[k] = v;
+            sum += v;
+        }
+        for (int k = 0; k < SRC_TAPS; k++)
+            src_fir[p][k] = (float) (h[k] / sum);
+    }
+}
+
+static inline float
+src_interp(const float *hist, double phase)
+{
+    double       fp = phase * SRC_PHASES;
+    int          p  = (int) fp;
+    float        f  = (float) (fp - p), a = 0.0f, b = 0.0f;
+    const float *h0 = src_fir[p], *h1 = src_fir[p + 1];
+
+    for (int k = 0; k < SRC_TAPS; k++) {
+        a += h0[k] * hist[k];
+        b += h1[k] * hist[k];
+    }
+    return a + (b - a) * f;
+}
+
 /* Mixer gain byte: 0x08 = unity, about 0.75 dB per step (signed), 0x80 =
    mute. Measured on the input side through DirectSound volume; the
    output side is assumed to follow the same law. */
@@ -331,6 +391,7 @@ init_tables(void)
 
     if (done)
         return;
+    init_src_fir();
     for (int b = 0; b < 256; b++) {
         if (b == 0x80)
             mix_gain_tab[b] = 0.0f;
@@ -437,7 +498,17 @@ dma_bps(int fmt)
 static double
 v2_now(v2_chip_t *c)
 {
-    return c->host.clock ? (double) c->host.clock(c->host.priv) / 12288000.0 : 0.0;
+    /* The 12.288 MHz counter wraps every 349.5 s, as on the real chip; the
+       log keeps counting past the wrap. */
+    uint32_t now;
+
+    if (!c->host.clock)
+        return 0.0;
+    now = c->host.clock(c->host.priv);
+    if (now < c->log_clk_last)
+        c->log_clk_wraps++;
+    c->log_clk_last = now;
+    return ((double) (c->log_clk_wraps << 32) + now) / 12288000.0;
 }
 
 static void
@@ -879,12 +950,10 @@ src_run(v2_chip_t *c, int s, float *out)
         st->phase += step;
         while (st->phase >= 1.0) {
             st->phase -= 1.0;
-            st->hist[0] = st->hist[1];
-            st->hist[1] = st->hist[2];
-            st->hist[2] = st->hist[3];
-            st->hist[3] = dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin);
+            memmove(st->hist, st->hist + 1, sizeof(float) * (SRC_TAPS - 1));
+            st->hist[SRC_TAPS - 1] = dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin);
         }
-        out[n] = interp4(st->hist, (float) st->phase);
+        out[n] = src_interp(st->hist, st->phase);
     }
 }
 
@@ -1657,7 +1726,15 @@ v2_read(v2_chip_t *c, uint32_t addr)
             v = c->irq_src | IRQ_ALWAYS;
             break;
         case IRQ_STAT:
-            v = (R(IRQ_STAT) & ~1u) | (c->irq_level ? 1 : 0);
+            /* Bits 0x4200 read set in nearly every real-card read (f2d8/f2d9);
+               bits 8-10 and 6-7 vary with activity and are not modelled. */
+            v = (R(IRQ_STAT) & ~1u) | 0x4200u | (c->irq_level ? 1 : 0);
+            break;
+        case 0x00010:
+        case 0x00010 + WT_BANK_STRIDE:
+            /* Polled by the MIDI synthesiser about 100 times a second; the real
+               card returned all ones throughout run 12 (no hardware voices in use). */
+            v = 0xffffffffu;
             break;
         case CODEC_CTRL:
             v = R(CODEC_CTRL) | 0x100; /* codec ready */
