@@ -73,6 +73,7 @@ typedef struct vortex2_t {
 
     int   rear_mix;
     int   log_routes;
+    int   cd_filter;
     FILE *logf;
     float out[V2_BLOCK * 4];
 
@@ -168,13 +169,40 @@ host_codec_read(void *priv, uint8_t reg)
     return dev->codec ? ac97_codec_readw(dev->codec, reg) : 0xffff;
 }
 
+/* CD audio reaches the SQ2500 as analog into the codec's CD input, which
+   the codec mixes straight into its output: so the codec's CD volume
+   (0x12) and master volume (0x02) apply to it, and nothing on the
+   Vortex itself does. */
+static void
+vortex2_filter_cd_audio(int channel, double *buffer, void *priv)
+{
+    const vortex2_t *dev = (const vortex2_t *) priv;
+    int              cl = 0, cr = 0, ml = 0, mr = 0;
+
+    if (!dev->codec) {
+        *buffer = 0.0;
+        return;
+    }
+    ac97_codec_getattn(dev->codec, 0x12, &cl, &cr);
+    ac97_codec_getattn(dev->codec, 0x02, &ml, &mr);
+    *buffer *= channel ? ((double) cr * mr / (32768.0 * 32768.0)) : ((double) cl * ml / (32768.0 * 32768.0));
+}
+
 static void
 host_codec_write(void *priv, uint8_t reg, uint16_t val)
 {
     vortex2_t *dev = (vortex2_t *) priv;
 
-    if (dev->codec)
+    if (dev->codec) {
         ac97_codec_writew(dev->codec, reg, val);
+        /* Install the CD filter once the driver sets up the CD input, as the
+           VIA AC'97 device does; the codec mutes CD at reset, so installing
+           it earlier would silence CD audio for software that never sets it. */
+        if (reg == 0x12 && !dev->cd_filter) {
+            sound_set_cd_audio_filter(vortex2_filter_cd_audio, dev);
+            dev->cd_filter = 1;
+        }
+    }
 }
 
 static void
