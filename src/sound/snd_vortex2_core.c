@@ -187,7 +187,9 @@ typedef struct v2_src_t {
 typedef struct v2_wtv_t {
     double   phase;
     float    hist[4];
-    float    lp;
+    float    z1, z2; /* treble filter state */
+    int      fbyte;  /* treble byte the coefficients below were made for, -1 = none */
+    float    fb0, fa1, fa2;
     uint32_t nin;
 } v2_wtv_t;
 
@@ -785,6 +787,7 @@ fifo_ctrl_write(v2_chip_t *c, v2_dma_t *d, uint32_t old, uint32_t val)
         if (d->is_wt) {
             v2_wtv_t *v = &c->wtv[d->ch];
             memset(v, 0, sizeof(*v));
+            v->fbyte = -1;
         } else {
             for (int r = 0; r < c->nroutes; r++) {
                 v2_route_t *rt = &c->route[r];
@@ -1008,8 +1011,11 @@ mix_run(v2_chip_t *c, int m, float *out)
 /* Wavetable voices                                                    */
 /*                                                                     */
 /* PARM0/PARM1 (identical apart from bit 0 = which side):              */
-/*   bits 31-24  high-frequency control, 0xcf = open (low-pass;         */
-/*               mapping is a hypothesis)                              */
+/*   bits 31-24  treble control: a two-pole low-pass, Q 0.64, whose    */
+/*               cut-off follows log2(fc) = 13.505 + 1.817u + 0.139u^2, */
+/*               u = (byte - 0xcf) / 16 (fitted to the real card's      */
+/*               echoes, test-suite run 14: 0xc2 = 4.7 kHz, 0xac =       */
+/*               1.2 kHz, 0x84 = 250 Hz); 0xcf and above = open         */
 /*   bits 23-16  gain, 0x10 per 6 dB, 0xcf = unity, 0 = silent         */
 /*   bits 15-0   rate: e = bits 15-13, m = bits 12-0,                  */
 /*               rate = 48 kHz * 2^(e-5) * (1 + m/8192)  (confirmed     */
@@ -1024,6 +1030,27 @@ wt_gain(uint32_t p)
 {
     int g = (p >> 16) & 0xff;
     return g ? powf(2.0f, (float) (g - 0xcf) / 16.0f) : 0.0f;
+}
+
+/* Treble low-pass for one voice: RBJ low-pass biquad, unity at DC. The
+   two zeros at Nyquist give b1 = 2 b0, b2 = b0. */
+static void
+wt_filter_set(v2_wtv_t *w, int f)
+{
+    if (f == w->fbyte)
+        return;
+    w->fbyte = f;
+    if (f >= 0xcf)
+        return;
+    double u  = (f - 0xcf) / 16.0;
+    double fc = pow(2.0, 13.505 + 1.817 * u + 0.139 * u * u);
+    double w0 = 2.0 * M_PI * fc / 48000.0;
+    double al = sin(w0) / (2.0 * 0.64);
+    double cs = cos(w0);
+    double a0 = 1.0 + al;
+    w->fb0    = (float) ((1.0 - cs) / 2.0 / a0);
+    w->fa1    = (float) (-2.0 * cs / a0);
+    w->fa2    = (float) ((1.0 - al) / a0);
 }
 
 static void
@@ -1052,7 +1079,8 @@ wt_bank_run(v2_chip_t *c, int bank)
         float    gl   = wt_gain(p0);
         float    gr   = wt_gain(p1);
         int      f    = (p0 >> 24) & 0xff;
-        float    a    = (f >= 0xcf) ? 1.0f : powf(2.0f, (float) (f - 0xcf) / 16.0f);
+        wt_filter_set(w, f);
+        int      open = f >= 0xcf;
         int      dir  = (ds >> lv) & 1;
         float   *od   = c->wt_direct[bank][lv];
         float   *bl   = c->wt_bus[bank][0];
@@ -1068,12 +1096,18 @@ wt_bank_run(v2_chip_t *c, int bank)
                 w->hist[3] = dma_take(c, d, 0, 1, &w->nin);
             }
             float y = interp4(w->hist, (float) w->phase);
-            w->lp += a * (y - w->lp);
+            if (!open) {
+                /* transposed direct form II */
+                float x = y;
+                y       = w->fb0 * x + w->z1;
+                w->z1   = 2.0f * w->fb0 * x - w->fa1 * y + w->z2;
+                w->z2   = w->fb0 * x - w->fa2 * y;
+            }
             if (dir)
-                od[n] = w->lp * gl;
+                od[n] = y * gl;
             else {
-                bl[n] += w->lp * gl;
-                br[n] += w->lp * gr;
+                bl[n] += y * gl;
+                br[n] += y * gr;
             }
         }
     }
@@ -1894,6 +1928,8 @@ v2_reset(v2_chip_t *c)
     }
     memset(c->src, 0, sizeof(c->src));
     memset(c->wtv, 0, sizeof(c->wtv));
+    for (int i = 0; i < NR_WTDMA; i++)
+        c->wtv[i].fbyte = -1;
     memset(c->a3d, 0, sizeof(c->a3d));
     memset(c->a3d_cur_dirty, 1, sizeof(c->a3d_cur_dirty));
     memset(&c->xt, 0, sizeof(c->xt));
