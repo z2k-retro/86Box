@@ -271,6 +271,7 @@ struct v2_chip_t {
 
     int     eq_dirty;
     v2_eq_t eq;
+    char    eq_logged[512];
 
     /* per-block evaluation */
     float   sbuf[256][B];
@@ -1471,6 +1472,20 @@ eq_load(v2_chip_t *c)
         c->eq.bypass[s] = LO16(R(s ? EQ_BYPASS_R : EQ_BYPASS_L)) / 32768.0f;
     }
     c->eq_dirty = 0;
+    if (c->host.log) {
+        /* the band gain may live at +0x28 (target) as well as +0x2c */
+        char line[512];
+        int  n = snprintf(line, sizeof(line), "Vortex2: [%9.3f] EQ bypass %04x/%04x gains(+28/+2c) L",
+                          v2_now(c), R(EQ_BYPASS_L) & 0xffff, R(EQ_BYPASS_R) & 0xffff);
+        for (int b = 0; b < 10; b++)
+            n += snprintf(line + n, sizeof(line) - n, " %04x/%04x", R(EQ_BASE + b * 0x30 + 0x28) & 0xffff,
+                          R(EQ_BASE + b * 0x30 + 0x2c) & 0xffff);
+        snprintf(line + n, sizeof(line) - n, "\n");
+        if (strcmp(line + 20, c->eq_logged) != 0) {
+            snprintf(c->eq_logged, sizeof(c->eq_logged), "%s", line + 20);
+            c->host.log(c->host.priv, line);
+        }
+    }
 }
 
 static void

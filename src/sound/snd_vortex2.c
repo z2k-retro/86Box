@@ -194,6 +194,10 @@ host_codec_write(void *priv, uint8_t reg, uint16_t val)
     vortex2_t *dev = (vortex2_t *) priv;
 
     if (dev->codec) {
+        if (dev->log_routes && dev->logf && reg != 0x26 && reg != 0x2c && reg != 0x32) {
+            fprintf(dev->logf, "Vortex2: [%9.3f] codec %02x <- %04x\n", (double) dev->frames / 48000.0, reg, val);
+            fflush(dev->logf);
+        }
         ac97_codec_writew(dev->codec, reg, val);
         /* Install the CD filter once the driver sets up the CD input, as the
            VIA AC'97 device does; the codec mutes CD at reset, so installing
