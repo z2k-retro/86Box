@@ -658,6 +658,8 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
     if (d->fn < (uint32_t) (nch * bps))
         dma_fill(c, d, 64);
     if (d->fn < (uint32_t) (nch * bps)) {
+        if (d->state == DMA_END)
+            d->fn = 0; /* a finished stream's last partial frame: drained */
         for (int i = 0; i < 4; i++)
             fr[i] = 0.0f; /* underrun */
         d->frame_no++;
@@ -1708,10 +1710,15 @@ v2_run_block(v2_chip_t *c, float *out)
         c->n_fired = c->n_acked = c->n_irq_raise = 0;
     }
 
-    /* Playback DMA channels with no consumer at all still drain. */
+    /* Playback DMA channels with no consumer at all still drain. That
+       includes a finished stream whose routes the driver removed before
+       its FIFO emptied: on the real card it goes idle within a few
+       milliseconds (Half-Life trace), and a model that left it "draining"
+       for good made the driver treat the channel as busy for the rest of
+       the game. */
     for (int ch = 0; ch < NR_ADBDMA; ch++) {
         v2_dma_t *d = &c->adb[ch];
-        if ((d->state == DMA_RUN || d->state == DMA_STALL) && !c->dma_nroutes[ch] && (R(dma_ctrl(d)) & 0x2000)) {
+        if ((d->state == DMA_RUN || d->state == DMA_STALL || (d->state == DMA_END && d->fn > 0)) && !c->dma_nroutes[ch] && (R(dma_ctrl(d)) & 0x2000)) {
             uint32_t cnt = d->frame_no;
             for (int n = 0; n < B; n++)
                 dma_take(c, d, 0, 1, &cnt);
@@ -1781,10 +1788,13 @@ v2_read(v2_chip_t *c, uint32_t addr)
             v = R(CODEC_CTRL) | 0x100; /* codec ready */
             break;
         default:
+            /* Channels the driver has not used yet: the real card reports
+               ADB channels idle (0x0050p000) and wavetable channels as
+               0x000ff000 (Half-Life trace). */
             if (addr >= WTDMA_STAT && addr < WTDMA_STAT + NR_WTDMA * 4)
-                v = c->wt[(addr - WTDMA_STAT) >> 2].touched ? dma_stat(c, &c->wt[(addr - WTDMA_STAT) >> 2]) : R(addr);
+                v = c->wt[(addr - WTDMA_STAT) >> 2].touched ? dma_stat(c, &c->wt[(addr - WTDMA_STAT) >> 2]) : 0x000ff000;
             else if (addr >= ADBDMA_STAT && addr < ADBDMA_STAT + NR_ADBDMA * 4)
-                v = c->adb[(addr - ADBDMA_STAT) >> 2].touched ? dma_stat(c, &c->adb[(addr - ADBDMA_STAT) >> 2]) : R(addr);
+                v = c->adb[(addr - ADBDMA_STAT) >> 2].touched ? dma_stat(c, &c->adb[(addr - ADBDMA_STAT) >> 2]) : 0x00500000;
             else if (addr >= WTDMA_PAGES && addr < ADBDMA_PAGES + 8)
                 v = dma_pages_word(c, addr);
             else if (addr >= FIFO_WTCTRL && addr < FIFO_ADBCTRL + NR_ADBDMA * 4) {
