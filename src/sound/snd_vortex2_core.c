@@ -1658,10 +1658,12 @@ v2_run_block(v2_chip_t *c, float *out)
                           c->irq_src, R(IRQ_CTRL), R(CHIP_CTRL));
         for (int ch = 0; ch < NR_ADBDMA && n < (int) sizeof(line) - 64; ch++) {
             v2_dma_t *d = &c->adb[ch];
-            if (d->state == DMA_IDLE)
+            /* a finished stream whose FIFO has drained reads as idle: leave
+               it out; one still draining shows as D */
+            if (d->state == DMA_IDLE || (d->state == DMA_END && d->fn == 0))
                 continue;
             n += snprintf(line + n, sizeof(line) - n, " A%d:%c%d/%03x %02x%02x",
-                          ch, "IRSE"[d->state], d->page, d->pos & 0xfff,
+                          ch, d->state == DMA_END ? 'D' : "IRSE"[d->state], d->page, d->pos & 0xfff,
                           R(dma_cfg(d)) >> 24, R(dma_cfg(d) + 4) >> 24);
         }
         int wt_run = 0, wt_stall = 0, wt_end = 0;
