@@ -75,6 +75,8 @@ typedef struct vortex2_t {
     int   log_routes;
     int   cd_filter;
     FILE *logf;
+    FILE *tracef; /* register trace, same format as the real-card sessions */
+    FILE *dmaf;   /* sample data the chip fetched: u32 addr, u32 len, bytes */
     float out[V2_BLOCK * 4];
 
     int16_t ring[V2_BLOCK * 8 * 2];
@@ -116,6 +118,11 @@ host_mem_read(void *priv, uint32_t addr, uint8_t *buf, uint32_t len)
         dma_bm_read(addr, buf, len, 4);
     else
         memset(buf, 0, len);
+    if (dev->dmaf) {
+        fwrite(&addr, 4, 1, dev->dmaf);
+        fwrite(&len, 4, 1, dev->dmaf);
+        fwrite(buf, 1, len, dev->dmaf);
+    }
 }
 
 static void
@@ -159,6 +166,31 @@ host_clock(void *priv)
     if (sub > V2_BLOCK * 256 - 1)
         sub = V2_BLOCK * 256 - 1;
     return dev->frames * 256u + (uint32_t) sub;
+}
+
+/* Register trace in the format of the real-card sessions' timeline.txt,
+   so the same tools replay either. */
+static double
+trace_time(const vortex2_t *dev)
+{
+    return (double) host_clock((void *) dev) / (256.0 * 48000.0);
+}
+
+static uint32_t
+tr_read(vortex2_t *dev, uint32_t a)
+{
+    uint32_t v = v2_read(dev->chip, a);
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  R 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+    return v;
+}
+
+static void
+tr_write(vortex2_t *dev, uint32_t a, uint32_t v)
+{
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  W 0x%05x mmio 0x%08x\n", trace_time(dev), a, v);
+    v2_write(dev->chip, a, v);
 }
 
 static uint16_t
@@ -320,7 +352,7 @@ vortex2_mmio_readl(uint32_t addr, void *priv)
 {
     vortex2_t *dev = (vortex2_t *) priv;
 
-    return v2_read(dev->chip, addr - dev->bar0);
+    return tr_read(dev, addr - dev->bar0);
 }
 
 static uint16_t
@@ -340,7 +372,7 @@ vortex2_mmio_writel(uint32_t addr, uint32_t val, void *priv)
 {
     vortex2_t *dev = (vortex2_t *) priv;
 
-    v2_write(dev->chip, addr - dev->bar0, val);
+    tr_write(dev, addr - dev->bar0, val);
 }
 
 static void
@@ -375,7 +407,7 @@ vortex2_mmio_writeb(uint32_t addr, uint8_t val, void *priv)
 static uint32_t
 io1_get(vortex2_t *dev, uint16_t port)
 {
-    return (port & 4) ? v2_read(dev->chip, dev->index & 0x3fffc) : dev->index;
+    return (port & 4) ? tr_read(dev, dev->index & 0x3fffc) : dev->index;
 }
 
 static void
@@ -384,7 +416,7 @@ io1_put(vortex2_t *dev, uint16_t port, uint32_t val, uint32_t mask)
     if (port & 4) {
         uint32_t a   = dev->index & 0x3fffc;
         uint32_t old = (mask == 0xffffffff) ? 0 : v2_read(dev->chip, a);
-        v2_write(dev->chip, a, (old & ~mask) | (val & mask));
+        tr_write(dev, a, (old & ~mask) | (val & mask));
     } else
         dev->index = (dev->index & ~mask) | (val & mask);
 }
@@ -624,6 +656,14 @@ vortex2_init(UNUSED(const device_t *info))
         }
     }
 
+    if (device_get_config_int("trace")) {
+        char fn[1024];
+        path_append_filename(fn, usr_path, "vortex2-trace.txt");
+        dev->tracef = plat_fopen(fn, "w");
+        path_append_filename(fn, usr_path, "vortex2-dma.bin");
+        dev->dmaf = plat_fopen(fn, "wb");
+    }
+
     memset(&host, 0, sizeof(host));
     host.priv        = dev;
     host.mem_read    = host_mem_read;
@@ -671,6 +711,10 @@ vortex2_close(void *priv)
     v2_destroy(dev->chip);
     if (dev->logf)
         fclose(dev->logf);
+    if (dev->tracef)
+        fclose(dev->tracef);
+    if (dev->dmaf)
+        fclose(dev->dmaf);
     free(dev);
 }
 
@@ -690,6 +734,17 @@ static const device_config_t vortex2_config[] = {
     {
         .name           = "log",
         .description    = "Write diagnostic log (vortex2.log in the machine folder)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "trace",
+        .description    = "Write register trace (vortex2-trace.txt and vortex2-dma.bin; large)",
         .type           = CONFIG_BINARY,
         .default_string = NULL,
         .default_int    = 0,
