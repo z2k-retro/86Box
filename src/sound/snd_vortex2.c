@@ -383,7 +383,7 @@ vortex2_mmio_writew(uint32_t addr, uint16_t val, void *priv)
     int        shift = (addr & 2) * 8;
     uint32_t   old   = v2_read(dev->chip, a);
 
-    v2_write(dev->chip, a, (old & ~(0xffffu << shift)) | ((uint32_t) val << shift));
+    tr_write(dev, a, (old & ~(0xffffu << shift)) | ((uint32_t) val << shift));
 }
 
 static void
@@ -394,7 +394,7 @@ vortex2_mmio_writeb(uint32_t addr, uint8_t val, void *priv)
     int        shift = (addr & 3) * 8;
     uint32_t   old   = v2_read(dev->chip, a);
 
-    v2_write(dev->chip, a, (old & ~(0xffu << shift)) | ((uint32_t) val << shift));
+    tr_write(dev, a, (old & ~(0xffu << shift)) | ((uint32_t) val << shift));
 }
 
 /* ------------------------------------------------------------------ */

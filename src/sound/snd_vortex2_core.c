@@ -1993,3 +1993,10 @@ v2_debug_source(v2_chip_t *c, int addr)
 {
     return c->sbuf[addr & 0xff];
 }
+
+/* Diagnostics: whether that source was evaluated in the last block. */
+int
+v2_debug_source_live(v2_chip_t *c, int addr)
+{
+    return c->sstate[addr & 0xff] == 2;
+}

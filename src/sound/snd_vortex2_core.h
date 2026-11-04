@@ -63,5 +63,6 @@ extern void v2_run_block(v2_chip_t *c, float *out);
 /* Diagnostics: 1 if A3D, wavetable or ADB work happened in the last block. */
 extern uint32_t v2_debug_flags(v2_chip_t *c);
 extern const float *v2_debug_source(v2_chip_t *c, int addr);
+extern int          v2_debug_source_live(v2_chip_t *c, int addr);
 
 #endif
