@@ -1077,8 +1077,12 @@ wt_bank_run(v2_chip_t *c, int bank)
     /* A voice goes to its own ADB source when the routing table uses that
        source, and then not to the mixed outputs: in A3D mode the Windows
        driver routes voices to 3D inputs at unity gain while DSREG stays 0,
-       so DSREG is not what selects this. */
-    uint32_t ds = R(bb + WT_DSREG) | c->wt_routed[bank];
+       so DSREG is not what selects this. Nor does DSREG take a voice off
+       the mixed outputs: for DirectSound buffers the driver sets a voice's
+       DSREG bit as it starts it and routes only the bank's mixed output
+       (Drakan in 86Box; bank 0 in SiN on the real card), so treating
+       DSREG as direct-only silenced every such voice. */
+    uint32_t ds = c->wt_routed[bank];
 
     memset(c->wt_direct[bank], 0, sizeof(c->wt_direct[bank]));
     memset(c->wt_bus[bank], 0, sizeof(c->wt_bus[bank]));
