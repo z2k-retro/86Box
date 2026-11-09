@@ -161,6 +161,7 @@ typedef struct v2_dma_t {
     uint8_t  state;
     uint8_t  page;
     uint8_t  touched; /* driver has started it since reset */
+    uint8_t  stopped; /* stopped by the driver, FIFO playing out */
     uint32_t pos;     /* byte offset in the current page */
     uint8_t  fifo[FIFO_LEN];
     uint32_t frd, fn;
@@ -560,6 +561,7 @@ dma_begin(v2_chip_t *c, v2_dma_t *d)
     d->page  = (R(dma_start(d)) >> ((15 - (d->ch & 15)) * 2)) & 3;
     d->pos   = R(dma_ctrl(d)) & 0xfff;
     d->state = DMA_RUN;
+    d->stopped = 0;
     dma_log_state(c, d, "started");
 }
 
@@ -572,6 +574,8 @@ dma_fill(v2_chip_t *c, v2_dma_t *d, uint32_t need)
 
     while (d->fn < need && guard-- > 0) {
         if (d->state == DMA_END) {
+            if (d->stopped)
+                return;
             /* Robustness: if the driver links the finished page after
                all (it was late), carry on instead of staying silent. */
             int nib = dma_nibble(c, d, d->page);
@@ -801,8 +805,18 @@ fifo_ctrl_write(v2_chip_t *c, v2_dma_t *d, uint32_t old, uint32_t val)
                     memset(&c->src[rt->sink - AK_SRCIN], 0, sizeof(v2_src_t));
             }
         }
-    } else if (!(val & FIFO_VALID) && (old & FIFO_VALID))
-        d->state = DMA_IDLE;
+    } else if (!(val & FIFO_VALID) && (old & FIFO_VALID)) {
+        /* Stopping a stream does not make it idle at once: the card plays
+           out what its FIFO holds, reporting "neither run nor idle", and
+           goes idle a millisecond or two later (SiN trace: 0x000bd05c,
+           0x000c105c, 0x000f1000, then 0x00500000). The driver acts on
+           that difference when it reuses the channel for the next sound. */
+        if (d->state == DMA_RUN || d->state == DMA_STALL) {
+            d->state   = d->fn > 0 ? DMA_END : DMA_IDLE;
+            d->stopped = 1;
+        } else if (d->state != DMA_END)
+            d->state = DMA_IDLE;
+    }
 }
 
 /* ------------------------------------------------------------------ */
