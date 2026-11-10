@@ -1074,15 +1074,18 @@ static void
 wt_bank_run(v2_chip_t *c, int bank)
 {
     uint32_t bb = bank * WT_BANK_STRIDE;
-    /* A voice goes to its own ADB source when the routing table uses that
-       source, and then not to the mixed outputs: in A3D mode the Windows
-       driver routes voices to 3D inputs at unity gain while DSREG stays 0,
-       so DSREG is not what selects this. Nor does DSREG take a voice off
-       the mixed outputs: for DirectSound buffers the driver sets a voice's
-       DSREG bit as it starts it and routes only the bank's mixed output
-       (Drakan in 86Box; bank 0 in SiN on the real card), so treating
-       DSREG as direct-only silenced every such voice. */
-    uint32_t ds = c->wt_routed[bank];
+    /* Where a voice goes. A voice whose own ADB source (0x40/0x80 + voice)
+       is in the routing table plays only into that route: in A3D mode the
+       Windows driver feeds 3D inputs that way, and those voices must stay
+       out of the stereo mix. Any other voice goes to one of the half's
+       mixed-output pairs, chosen by its DSREG bit: set = outputs 32/33
+       (Confirmed: test-suite run 16 on a real SQ2500, where clearing the
+       bit under a playing DirectSound voice silenced it, 87 dB down, with
+       only 32/33 routed), clear = outputs 36/37 (Hypothesis: Half-Life
+       routes the second half's 36/37 to the mixer and plays voices 4-29
+       there with DSREG 0). Outputs 34/35 are never fed. */
+    uint32_t routed = c->wt_routed[bank];
+    uint32_t ds     = R(bb + WT_DSREG);
 
     memset(c->wt_direct[bank], 0, sizeof(c->wt_direct[bank]));
     memset(c->wt_bus[bank], 0, sizeof(c->wt_bus[bank]));
@@ -1102,10 +1105,11 @@ wt_bank_run(v2_chip_t *c, int bank)
         int      f    = (p0 >> 24) & 0xff;
         wt_filter_set(w, f);
         int      open = f >= 0xcf;
-        int      dir  = (ds >> lv) & 1;
+        int      dir  = (routed >> lv) & 1;
+        int      pair = ((ds >> lv) & 1) ? 0 : 4;
         float   *od   = c->wt_direct[bank][lv];
-        float   *bl   = c->wt_bus[bank][0];
-        float   *br   = c->wt_bus[bank][1];
+        float   *bl   = c->wt_bus[bank][pair];
+        float   *br   = c->wt_bus[bank][pair + 1];
 
         for (int n = 0; n < B; n++) {
             w->phase += step;
