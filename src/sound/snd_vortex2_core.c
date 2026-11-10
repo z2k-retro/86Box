@@ -57,6 +57,7 @@
 #define FIFO_ADBCTRL   0x16100 /* + channel * 4, 32 channels */
 #define FIFO_VALID     0x00000010
 #define FIFO_EMPTY     0x00000020
+#define FIFO_RDY2      0x00000040 /* idle channel set up with bit 13: see v2_read */
 #define FIFO_U1        0x00040000
 
 #define A3D_BASE       0x18000
@@ -1840,8 +1841,17 @@ v2_read(v2_chip_t *c, uint32_t addr)
                 int       wt = addr < FIFO_ADBCTRL;
                 v2_dma_t *d  = wt ? &c->wt[(addr - FIFO_WTCTRL) >> 2] : &c->adb[(addr - FIFO_ADBCTRL) >> 2];
                 v            = R(addr) & ~FIFO_EMPTY;
-                if (d->fn == 0 && d->state != DMA_RUN)
+                /* An idle channel reads back "empty" (0x20); one whose control
+                   word has bit 13 set (0x42000, the driver's stereo/16-bit set-up)
+                   also reads 0x40 (every real trace: 0x41000 -> 0x41020,
+                   0x42000 -> 0x42060). The driver's DirectSound path waits for
+                   0x40 before starting the channel: without it Minerva's
+                   streaming buffer never started in 86Box. */
+                if (d->fn == 0 && d->state != DMA_RUN) {
                     v |= FIFO_EMPTY;
+                    if (R(addr) & 0x2000)
+                        v |= FIFO_RDY2;
+                }
             } else
                 v = R(addr);
             break;
