@@ -54,6 +54,7 @@
 #define WT_PARM        0x0200 /* + voice * 0x10 + n * 4 */
 
 #define FIFO_WTCTRL    0x16000 /* + channel * 4, 64 channels */
+#define WT_FIFO_RAM    0x10000 /* + channel * 0x100: each channel's 64-word FIFO */
 #define FIFO_ADBCTRL   0x16100 /* + channel * 4, 32 channels */
 #define FIFO_VALID     0x00000010
 #define FIFO_EMPTY     0x00000020
@@ -186,6 +187,7 @@ typedef struct v2_src_t {
     float    hist[2 * SRC_PAD]; /* circular, every sample written twice */
     int      hpos;
     int      zrun;              /* consecutive silent input samples */
+    uint32_t last_run;          /* block (glide_frames + 1) it last ran in */
     uint32_t nin;
 } v2_src_t;
 
@@ -266,6 +268,7 @@ struct v2_chip_t {
     v2_a3d_t a3d[NR_A3D];
     uint8_t  a3d_cur_dirty[NR_A3D];
     uint8_t  a3d_tgt_dirty[NR_A3D]; /* a target or glide-rate word was written */
+    int16_t  src_owner[NR_SRC]; /* source each converter last converted */
     uint8_t  a3d_used[NR_A3D];
     uint32_t graph_hash;
     uint32_t glide_frames; /* sample count for the 64-sample glide tick */
@@ -916,6 +919,16 @@ graph_rebuild(v2_chip_t *c)
         }
     }
     c->graph_dirty = 0;
+    /* A converter handed a different source starts empty: on the chip its
+       history would hold the new source's recent input, not the tail of
+       whatever it converted before (heard as a short burst). */
+    for (int r = 0; r < c->nroutes; r++) {
+        int sink = c->route[r].sink;
+        if (sink >= AK_SRCIN && sink < AK_SRCIN + NR_SRC && c->src_owner[sink - AK_SRCIN] != c->route[r].src) {
+            memset(&c->src[sink - AK_SRCIN], 0, sizeof(v2_src_t));
+            c->src_owner[sink - AK_SRCIN] = c->route[r].src;
+        }
+    }
     for (int r = 0; r < c->nroutes; r++) {
         int src = c->route[r].src;
         if (src >= AS_WT0 && src < AS_WT0 + 32)
@@ -988,9 +1001,31 @@ src_run(v2_chip_t *c, int s, float *out)
     double    step = (double) (R(SRC_CONVRATIO + s * 4) & 0x3ffff) / 16384.0;
     if (step > 8.0)
         step = 8.0;
+
+    /* The model runs a converter only when something downstream reads it;
+       the chip runs every converter every sample. If this one missed
+       blocks, the chip would have consumed that input meanwhile: skip it
+       rather than play it late (heard as a burst of the previous sound's
+       tail after silence). */
+    uint32_t now = c->glide_frames + 1;
+    if (st->last_run != now && st->last_run + B != now) {
+        if (st->nin < d->frame_no)
+            st->nin = d->frame_no;
+        memset(st->hist, 0, sizeof(st->hist));
+        st->zrun = SRC_PAD;
+    }
+    st->last_run = now;
+
     if (d->state == DMA_IDLE) {
+        /* An idle source feeds the converter silence, so its history
+           empties; otherwise the next sound would start with the tail of
+           an older one (heard as a short burst). */
         memset(out, 0, sizeof(float) * B);
         st->phase = 0.0;
+        if (st->zrun < SRC_PAD) {
+            memset(st->hist, 0, sizeof(st->hist));
+            st->zrun = SRC_PAD;
+        }
         return;
     }
     c->dbg |= 4;
@@ -2011,6 +2046,23 @@ v2_write(v2_chip_t *c, uint32_t addr, uint32_t val)
     old     = R(addr);
     R(addr) = val;
 
+    if (addr >= WT_FIFO_RAM && addr < WT_FIFO_RAM + NR_WTDMA * 0x100) {
+        /* The driver clears a wavetable channel's FIFO memory (64 words)
+           whenever it stops or restarts the voice. A stopped channel plays
+           out what its FIFO holds, so on a real card that play-out is now
+           silence; the model keeps its own copy of the FIFO, so clear that
+           (state and fill level stay, for the status the driver reads). */
+        int       ch = (addr - WT_FIFO_RAM) >> 8;
+        v2_dma_t *d  = &c->wt[ch];
+        if (d->state != DMA_RUN) {
+            /* everything downstream of the FIFO that still holds the old
+               sound: decoded frames and the voice's interpolation history */
+            memset(d->fifo, 0, sizeof(d->fifo));
+            memset(d->frame, 0, sizeof(d->frame));
+            memset(c->wtv[ch].hist, 0, sizeof(c->wtv[ch].hist));
+        }
+        return;
+    }
     if (addr >= A3D_BASE && addr < A3D_END) {
         uint32_t off = (addr - A3D_BASE) & 0x1fff;
         if (off >= 0x1000 && off < 0x1000 + 4 * 0x2c8) {
@@ -2146,6 +2198,7 @@ v2_reset(v2_chip_t *c)
     memset(c->a3d, 0, sizeof(c->a3d));
     memset(c->a3d_cur_dirty, 1, sizeof(c->a3d_cur_dirty));
     memset(c->a3d_tgt_dirty, 1, sizeof(c->a3d_tgt_dirty));
+    memset(c->src_owner, 0xff, sizeof(c->src_owner));
     memset(&c->xt, 0, sizeof(c->xt));
     memset(&c->eq, 0, sizeof(c->eq));
     memset(c->sbuf, 0, sizeof(c->sbuf));
