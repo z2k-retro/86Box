@@ -179,10 +179,13 @@ typedef struct v2_route_t {
 
 #define SRC_TAPS   22  /* converter FIR length in input samples */
 #define SRC_PHASES 256
+#define SRC_PAD    24  /* SRC_TAPS rounded up to a multiple of 4 (leading zero taps) */
 
 typedef struct v2_src_t {
     double   phase;
-    float    hist[SRC_TAPS];
+    float    hist[2 * SRC_PAD]; /* circular, every sample written twice */
+    int      hpos;
+    int      zrun;              /* consecutive silent input samples */
     uint32_t nin;
 } v2_src_t;
 
@@ -206,6 +209,9 @@ typedef struct v2_a3d_t {
     int   dlpos;
     float fh[2][HRTF_TAPS - 1 + B]; /* FIR history */
     int   active;
+    int   zrun;  /* consecutive silent input samples */
+    int   settled; /* every glide has reached its target: nothing to update */
+    int   quiet; /* silent input and empty filters: the signal path is skipped */
 } v2_a3d_t;
 
 typedef struct { float re, im; } cpx;
@@ -215,8 +221,9 @@ typedef struct { float re, im; } cpx;
 typedef struct v2_xt_t {
     int   mode; /* 0 pass-through, 1 wide, 2 narrow */
     float prev[2][B];
-    cpx   fdl[2][XT_P][XT_N];
+    cpx   fdl[2][XT_P][XT_N / 2 + 1]; /* input spectra (real signals: half) */
     int   head;
+    int   zb; /* consecutive silent input blocks */
 } v2_xt_t;
 
 typedef struct v2_eq_t {
@@ -258,6 +265,7 @@ struct v2_chip_t {
     v2_wtv_t wtv[NR_WTDMA];
     v2_a3d_t a3d[NR_A3D];
     uint8_t  a3d_cur_dirty[NR_A3D];
+    uint8_t  a3d_tgt_dirty[NR_A3D]; /* a target or glide-rate word was written */
     uint8_t  a3d_used[NR_A3D];
     uint32_t graph_hash;
     uint32_t glide_frames; /* sample count for the 64-sample glide tick */
@@ -336,7 +344,7 @@ interp4(const float *h, float t)
    Kaiser-windowed sinc (beta 6, cutoff at the input Nyquist) matches that
    to within the measurement scatter. src_fir[p] holds the taps for a
    fractional position p / SRC_PHASES between hist[10] and hist[11]. */
-static float src_fir[SRC_PHASES + 1][SRC_TAPS];
+static float src_fir[SRC_PHASES + 1][SRC_PAD]; /* taps in [SRC_PAD - SRC_TAPS ..] */
 
 static double
 bessel_i0(double x)
@@ -364,24 +372,32 @@ init_src_fir(void)
             h[k] = v;
             sum += v;
         }
+        for (int k = 0; k < SRC_PAD - SRC_TAPS; k++)
+            src_fir[p][k] = 0.0f;
         for (int k = 0; k < SRC_TAPS; k++)
-            src_fir[p][k] = (float) (h[k] / sum);
+            src_fir[p][SRC_PAD - SRC_TAPS + k] = (float) (h[k] / sum);
     }
 }
 
+/* hist: the last SRC_PAD input samples, oldest first. */
 static inline float
 src_interp(const float *hist, double phase)
 {
     double       fp = phase * SRC_PHASES;
     int          p  = (int) fp;
-    float        f  = (float) (fp - p), a = 0.0f, b = 0.0f;
+    float        f  = (float) (fp - p);
     const float *h0 = src_fir[p], *h1 = src_fir[p + 1];
+    float        a[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, b[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
-    for (int k = 0; k < SRC_TAPS; k++) {
-        a += h0[k] * hist[k];
-        b += h1[k] * hist[k];
-    }
-    return a + (b - a) * f;
+    /* Four independent lanes, so the compiler can use SSE. */
+    for (int k = 0; k < SRC_PAD; k += 4)
+        for (int j = 0; j < 4; j++) {
+            a[j] += h0[k + j] * hist[k + j];
+            b[j] += h1[k + j] * hist[k + j];
+        }
+    float sa = (a[0] + a[1]) + (a[2] + a[3]);
+    float sb = (b[0] + b[1]) + (b[2] + b[3]);
+    return sa + (sb - sa) * f;
 }
 
 /* Mixer gain byte: 0x08 = unity, about 0.75 dB per step (signed), 0x80 =
@@ -978,10 +994,13 @@ src_run(v2_chip_t *c, int s, float *out)
         st->phase += step;
         while (st->phase >= 1.0) {
             st->phase -= 1.0;
-            memmove(st->hist, st->hist + 1, sizeof(float) * (SRC_TAPS - 1));
-            st->hist[SRC_TAPS - 1] = dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin);
+            float v = dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin);
+            st->hist[st->hpos] = st->hist[st->hpos + SRC_PAD] = v;
+            st->hpos = (st->hpos + 1) % SRC_PAD;
+            st->zrun = (v == 0.0f) ? st->zrun + 1 : 0;
         }
-        out[n] = src_interp(st->hist, st->phase);
+        /* A window of silence converts to exact silence. */
+        out[n] = (st->zrun >= SRC_PAD) ? 0.0f : src_interp(st->hist + st->hpos, st->phase);
     }
 }
 
@@ -1112,6 +1131,7 @@ wt_bank_run(v2_chip_t *c, int bank)
         float   *bl   = c->wt_bus[bank][pair];
         float   *br   = c->wt_bus[bank][pair + 1];
 
+        float y[B];
         for (int n = 0; n < B; n++) {
             w->phase += step;
             while (w->phase >= 1.0) {
@@ -1121,21 +1141,29 @@ wt_bank_run(v2_chip_t *c, int bank)
                 w->hist[2] = w->hist[3];
                 w->hist[3] = dma_take(c, d, 0, 1, &w->nin);
             }
-            float y = interp4(w->hist, (float) w->phase);
-            if (!open) {
-                /* transposed direct form II */
-                float x = y;
-                y       = w->fb0 * x + w->z1;
-                w->z1   = 2.0f * w->fb0 * x - w->fa1 * y + w->z2;
-                w->z2   = w->fb0 * x - w->fa2 * y;
-            }
-            if (dir)
-                od[n] = y * gl;
-            else {
-                bl[n] += y * gl;
-                br[n] += y * gr;
-            }
+            y[n] = interp4(w->hist, (float) w->phase);
         }
+        if (!open) {
+            /* transposed direct form II */
+            float z1 = w->z1, z2 = w->z2;
+            for (int n = 0; n < B; n++) {
+                float x = y[n];
+                float o = w->fb0 * x + z1;
+                z1      = 2.0f * w->fb0 * x - w->fa1 * o + z2;
+                z2      = w->fb0 * x - w->fa2 * o;
+                y[n]    = o;
+            }
+            w->z1 = z1;
+            w->z2 = z2;
+        }
+        if (dir)
+            for (int n = 0; n < B; n++)
+                od[n] = y[n] * gl;
+        else
+            for (int n = 0; n < B; n++) {
+                bl[n] += y[n] * gl;
+                br[n] += y[n] * gr;
+            }
     }
     c->wt_done[bank] = 1;
 }
@@ -1222,34 +1250,73 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
     uint32_t     ba = a3d_a(s);
     const float *x  = gather(c, AK_A3DIN + s);
 
-    if (!a->loaded || c->a3d_cur_dirty[s])
+    if (!a->loaded || c->a3d_cur_dirty[s]) {
         a3d_load_current(c, s);
+        a->settled = 0;
+    }
+    if (c->a3d_tgt_dirty[s]) {
+        a->settled = 0;
+        c->a3d_tgt_dirty[s] = 0;
+    }
     c->a3d_used[s] = 1;
     c->a3d_cur_dirty[s] = 0;
 
-    /* Glide current values toward the targets. */
-    float kh = glide_k(c, R(ba + 0x37c), 2097152.0);
-    float kg = glide_k(c, R(ba + 0x380), 2097152.0);
-    float kc = glide_k(c, R(ba + 0x384), 2097152.0);
-    float ki = glide_k(c, R(ba + 0x388), 524288.0);
-    if (kh > 0.0f)
-        for (int k = 0; k < HRTF_TAPS; k++) {
-            uint32_t w = R(bb + 0x100 + k * 4);
-            a->h[0][k] += (LO16(w) / 32768.0f - a->h[0][k]) * kh;
-            a->h[1][k] += (HI16(w) / 32768.0f - a->h[1][k]) * kh;
+    /* Glide current values toward the targets. Once nothing moves, the
+       slot is settled until the driver writes a target, a glide rate or a
+       current value. */
+    /* Glides step once every 64 samples, so only a block with a step can
+       show that nothing moves any more. */
+    if (!a->settled && (c->glide_frames % 64) + B >= 64) {
+        int   moved = 0;
+        float kh = glide_k(c, R(ba + 0x37c), 2097152.0);
+        float kg = glide_k(c, R(ba + 0x380), 2097152.0);
+        float kc = glide_k(c, R(ba + 0x384), 2097152.0);
+        float ki = glide_k(c, R(ba + 0x388), 524288.0);
+        if (kh > 0.0f)
+            for (int k = 0; k < HRTF_TAPS; k++) {
+                uint32_t w  = R(bb + 0x100 + k * 4);
+                float    h0 = a->h[0][k] + (LO16(w) / 32768.0f - a->h[0][k]) * kh;
+                float    h1 = a->h[1][k] + (HI16(w) / 32768.0f - a->h[1][k]) * kh;
+                moved |= (h0 != a->h[0][k]) | (h1 != a->h[1][k]);
+                a->h[0][k] = h0;
+                a->h[1][k] = h1;
+            }
+        if (kg > 0.0f) {
+            float g = a->gain + (LO16(R(bb + 0xe4)) / 32768.0f - a->gain) * kg;
+            moved |= g != a->gain;
+            a->gain = g;
         }
-    if (kg > 0.0f)
-        a->gain += (LO16(R(bb + 0xe4)) / 32768.0f - a->gain) * kg;
-    if (kc > 0.0f) {
-        float t[5] = { LO16(R(bb + 0xec)) / 16384.0f, HI16(R(bb + 0xec)) / 16384.0f,
-                       LO16(R(bb + 0xf4)) / 16384.0f, HI16(R(bb + 0xf4)) / 16384.0f,
-                       LO16(R(bb + 0xfc)) / 16384.0f };
-        for (int i = 0; i < 5; i++)
-            a->co[i] += (t[i] - a->co[i]) * kc;
-    }
-    if (ki > 0.0f) {
-        a->itd[0] += ((float) (uint16_t) R(bb + 0x1e4) / 512.0f - a->itd[0]) * ki;
-        a->itd[1] += ((float) (uint16_t) (R(bb + 0x1e4) >> 16) / 512.0f - a->itd[1]) * ki;
+        if (kc > 0.0f) {
+            float t[5] = { LO16(R(bb + 0xec)) / 16384.0f, HI16(R(bb + 0xec)) / 16384.0f,
+                           LO16(R(bb + 0xf4)) / 16384.0f, HI16(R(bb + 0xf4)) / 16384.0f,
+                           LO16(R(bb + 0xfc)) / 16384.0f };
+            for (int i = 0; i < 5; i++) {
+                float v = a->co[i] + (t[i] - a->co[i]) * kc;
+                moved |= v != a->co[i];
+                a->co[i] = v;
+            }
+        }
+        if (ki > 0.0f) {
+            float i0 = a->itd[0] + ((float) (uint16_t) R(bb + 0x1e4) / 512.0f - a->itd[0]) * ki;
+            float i1 = a->itd[1] + ((float) (uint16_t) (R(bb + 0x1e4) >> 16) / 512.0f - a->itd[1]) * ki;
+            moved |= (i0 != a->itd[0]) | (i1 != a->itd[1]);
+            a->itd[0] = i0;
+            a->itd[1] = i1;
+        }
+
+        if (moved) {
+            /* Make the current values visible to the driver (halves
+               swapped, as in the registers). */
+            for (int k = 0; k < HRTF_TAPS; k++)
+                R(bb + k * 4) = pack16(a->h[1][k], a->h[0][k], 32768.0f);
+            R(bb + 0xe0)  = pack16(a->gain, a->gain, 32768.0f);
+            R(bb + 0xe8)  = pack16(a->co[1], a->co[0], 16384.0f);
+            R(bb + 0xf0)  = pack16(a->co[3], a->co[2], 16384.0f);
+            R(bb + 0xf8)  = pack16(0.0f, a->co[4], 16384.0f);
+            R(bb + 0x1e0) = ((uint32_t) (uint16_t) lrintf(clampf(a->itd[0] * 512.0f, 0.0f, 65535.0f)) << 16)
+                | (uint16_t) lrintf(clampf(a->itd[1] * 512.0f, 0.0f, 65535.0f));
+        } else
+            a->settled = 1;
     }
 
     /* Never let a bad coefficient set (or a glide through one) poison
@@ -1261,18 +1328,19 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
         memset(a->fh, 0, sizeof(a->fh));
     }
 
-    /* Make the current values visible to the driver (halves swapped, as
-       in the registers). */
-    for (int k = 0; k < HRTF_TAPS; k++)
-        R(bb + k * 4) = pack16(a->h[1][k], a->h[0][k], 32768.0f);
-    R(bb + 0xe0)  = pack16(a->gain, a->gain, 32768.0f);
-    R(bb + 0xe8)  = pack16(a->co[1], a->co[0], 16384.0f);
-    R(bb + 0xf0)  = pack16(a->co[3], a->co[2], 16384.0f);
-    R(bb + 0xf8)  = pack16(0.0f, a->co[4], 16384.0f);
-    R(bb + 0x1e0) = ((uint32_t) (uint16_t) lrintf(clampf(a->itd[0] * 512.0f, 0.0f, 65535.0f)) << 16)
-        | (uint16_t) lrintf(clampf(a->itd[1] * 512.0f, 0.0f, 65535.0f));
-
     c->dbg |= 1;
+
+    /* An idle source the driver leaves routed gets silent input. Once its
+       filters have emptied, its output is exactly zero, so skip the signal
+       path (most slots, most of the time); the glides above still run. */
+    int silent = 1;
+    for (int n = 0; n < B; n++)
+        if (x[n] != 0.0f) {
+            silent = 0;
+            break;
+        }
+    if (silent && a->quiet)
+        return;
 
     /* Atmospheric filter and gain, then per ear: ITD delay and the FIR. */
     float d[2];
@@ -1299,15 +1367,38 @@ a3d_slot_run(v2_chip_t *c, int s, float *outl, float *outr)
         }
     }
     for (int e = 0; e < 2; e++) {
-        float *o = e ? outr : outl;
-        float *h = a->fh[e];
-        for (int n = 0; n < B; n++) {
-            float acc = 0.0f;
-            for (int k = 0; k < HRTF_TAPS; k++)
-                acc += a->h[e][k] * h[HRTF_TAPS - 1 + n - k];
-            o[n] += acc;
+        float       *o = e ? outr : outl;
+        float       *h = a->fh[e];
+        const float *t = a->h[e];
+        float        acc[B];
+        /* Tap-outer order, so the inner loop vectorises. */
+        for (int n = 0; n < B; n++)
+            acc[n] = 0.0f;
+        for (int k = 0; k < HRTF_TAPS; k++) {
+            const float  tk  = t[k];
+            const float *src = h + HRTF_TAPS - 1 - k;
+            for (int n = 0; n < B; n++)
+                acc[n] += tk * src[n];
         }
+        for (int n = 0; n < B; n++)
+            o[n] += acc[n];
         memmove(h, h + B, sizeof(float) * (HRTF_TAPS - 1));
+    }
+
+    /* Track silence: once the input has been silent for longer than the
+       delay line and the FIR, and the filter state has decayed, clear the
+       state and mark the slot quiet. */
+    if (silent) {
+        a->zrun += B;
+        if (a->zrun >= ITD_LEN + HRTF_TAPS + B && fabsf(a->y1) < 1e-9f && fabsf(a->y2) < 1e-9f) {
+            a->x1 = a->x2 = a->y1 = a->y2 = 0.0f;
+            memset(a->dl, 0, sizeof(a->dl));
+            memset(a->fh, 0, sizeof(a->fh));
+            a->quiet = 1;
+        }
+    } else {
+        a->zrun  = 0;
+        a->quiet = 0;
     }
 }
 
@@ -1452,33 +1543,63 @@ xt_run(v2_chip_t *c)
     } else {
         v2_xt_t *x = &c->xt;
         int      m = x->mode - 1;
-        x->head    = (x->head + 1) % XT_P;
-        for (int s = 0; s < 2; s++) {
-            cpx *f = x->fdl[s][x->head];
-            for (int i = 0; i < B; i++) {
-                f[i]     = (cpx) { x->prev[s][i], 0.0f };
-                f[i + B] = (cpx) { in[s][i], 0.0f };
-            }
-            memcpy(x->prev[s], in[s], sizeof(in[s]));
-            fft(c, f, 0);
+        int      silent = 1;
+        for (int i = 0; i < B && silent; i++)
+            if (in[0][i] != 0.0f || in[1][i] != 0.0f)
+                silent = 0;
+        x->zb = silent ? x->zb + 1 : 0;
+        if (x->zb > XT_P + 1) {
+            /* Every partition holds silence: the output is silence. */
+            memset(c->xt_out, 0, sizeof(c->xt_out));
+            c->xt_done = 1;
+            return;
         }
-        for (int s = 0; s < 2; s++) {
-            cpx y[XT_N];
-            memset(y, 0, sizeof(y));
+        x->head = (x->head + 1) % XT_P;
+
+        /* Both channels through one complex FFT (left real, right
+           imaginary), then split into the two half spectra. */
+        cpx z[XT_N];
+        for (int i = 0; i < B; i++) {
+            z[i]     = (cpx) { x->prev[0][i], x->prev[1][i] };
+            z[i + B] = (cpx) { in[0][i], in[1][i] };
+        }
+        memcpy(x->prev, in, sizeof(in));
+        fft(c, z, 0);
+        cpx *f0 = x->fdl[0][x->head], *f1 = x->fdl[1][x->head];
+        for (int k = 0; k <= XT_N / 2; k++) {
+            cpx a = z[k], b = z[(XT_N - k) & (XT_N - 1)];
+            f0[k] = (cpx) { 0.5f * (a.re + b.re), 0.5f * (a.im - b.im) };
+            f1[k] = (cpx) { 0.5f * (a.im + b.im), 0.5f * (b.re - a.re) };
+        }
+
+        cpx y[2][XT_N / 2 + 1];
+        memset(y, 0, sizeof(y));
+        for (int s = 0; s < 2; s++)
             for (int p = 0; p < XT_P; p++) {
                 int        slot = (x->head - p + XT_P) % XT_P;
                 const cpx *xs   = x->fdl[s][slot];
                 const cpx *xo   = x->fdl[s ^ 1][slot];
                 const cpx *hs   = c->xt_h[m][0][p];
                 const cpx *hc   = c->xt_h[m][1][p];
-                for (int k = 0; k < XT_N; k++) {
-                    y[k].re += xs[k].re * hs[k].re - xs[k].im * hs[k].im + xo[k].re * hc[k].re - xo[k].im * hc[k].im;
-                    y[k].im += xs[k].re * hs[k].im + xs[k].im * hs[k].re + xo[k].re * hc[k].im + xo[k].im * hc[k].re;
+                for (int k = 0; k <= XT_N / 2; k++) {
+                    y[s][k].re += xs[k].re * hs[k].re - xs[k].im * hs[k].im + xo[k].re * hc[k].re - xo[k].im * hc[k].im;
+                    y[s][k].im += xs[k].re * hs[k].im + xs[k].im * hs[k].re + xo[k].re * hc[k].im + xo[k].im * hc[k].re;
                 }
             }
-            fft(c, y, 1);
-            for (int n = 0; n < B; n++)
-                c->xt_out[s][n] = y[B + n].re / XT_N;
+
+        /* Both outputs through one inverse FFT: W = Y0 + i Y1, with the
+           upper bins rebuilt from conjugate symmetry. */
+        cpx w[XT_N];
+        for (int k = 0; k <= XT_N / 2; k++)
+            w[k] = (cpx) { y[0][k].re - y[1][k].im, y[0][k].im + y[1][k].re };
+        for (int k = XT_N / 2 + 1; k < XT_N; k++) {
+            int j = XT_N - k;
+            w[k]  = (cpx) { y[0][j].re + y[1][j].im, y[1][j].re - y[0][j].im };
+        }
+        fft(c, w, 1);
+        for (int n = 0; n < B; n++) {
+            c->xt_out[0][n] = w[B + n].re / XT_N;
+            c->xt_out[1][n] = w[B + n].im / XT_N;
         }
     }
     c->xt_done = 1;
@@ -1893,6 +2014,13 @@ v2_write(v2_chip_t *c, uint32_t addr, uint32_t val)
             uint32_t rel = (off - 0x1000) % 0x2c8;
             if (rel < 0xe0 || rel == 0xe0 || rel == 0xe8 || rel == 0xf0 || rel == 0xf8 || rel == 0x1e0)
                 c->a3d_cur_dirty[s] = 1;
+            else
+                c->a3d_tgt_dirty[s] = 1;
+        } else if (off < 0x1000) {
+            /* bank A (glide rates): mark the slice's four sources */
+            int sl = ((addr - A3D_BASE) >> 13) * 4;
+            if (sl + 4 <= NR_A3D)
+                memset(&c->a3d_tgt_dirty[sl], 1, 4);
         }
         return;
     }
@@ -2013,6 +2141,7 @@ v2_reset(v2_chip_t *c)
         c->wtv[i].fbyte = -1;
     memset(c->a3d, 0, sizeof(c->a3d));
     memset(c->a3d_cur_dirty, 1, sizeof(c->a3d_cur_dirty));
+    memset(c->a3d_tgt_dirty, 1, sizeof(c->a3d_tgt_dirty));
     memset(&c->xt, 0, sizeof(c->xt));
     memset(&c->eq, 0, sizeof(c->eq));
     memset(c->sbuf, 0, sizeof(c->sbuf));
