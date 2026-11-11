@@ -1380,23 +1380,23 @@ xt_prepare(v2_chip_t *c)
         c->tw[i] = (cpx) { (float) cos(-2.0 * M_PI * i / XT_N), (float) sin(-2.0 * M_PI * i / XT_N) };
 
     /* The fitted E filters are normalised to 0 dB between 300 Hz and 3 kHz;
-       their absolute level was not part of the fit. Minerva on a real card
-       (satellites; the same DirectSound 3D source played through the
-       canceller there and with headphones in 86Box, same HRTF taps) puts
-       the real canceller 5.5 dB below the normalised model, flat within
-       about 1.5 dB from 200 Hz to 10 kHz. Run 2's tap fit (-6.5 dB) agrees.
-       Monitors are assumed to share the scale. */
-    const float scale = 0.531f; /* -5.5 dB */
+       their absolute level was not part of the fit. Minerva's DirectSound 3D
+       tests, played through the canceller on a real card and with headphones
+       in 86Box (same source, same HRTF taps), put the real canceller below
+       the normalised model by 5.5 dB for satellites and 6.2 dB for monitors,
+       each flat within about 1.5 dB from 200 Hz to 10 kHz (24 half-octave
+       bands over two tests). Run 2's tap fit (-6.5 dB, satellites) agrees. */
+    static const float scale_m[2] = { 0.531f, 0.490f }; /* wide -5.5 dB, narrow -6.2 dB */
 
     for (int m = 0; m < 2; m++) {
         /* same side: E delayed by the model latency; cross: E * X */
         memset(hs, 0, sizeof(hs));
         memset(hc, 0, sizeof(hc));
         for (int i = 0; i < V2_XT_TAPS && i + V2_XT_LATENCY < XT_P * B; i++)
-            hs[i + V2_XT_LATENCY] = scale * E[m][i];
+            hs[i + V2_XT_LATENCY] = scale_m[m] * E[m][i];
         for (int i = 0; i < V2_XT_TAPS; i++)
             for (int j = 0; j < V2_XT_TAPS && i + j < XT_P * B; j++)
-                hc[i + j] += scale * E[m][i] * X[m][j];
+                hc[i + j] += scale_m[m] * E[m][i] * X[m][j];
         for (int p = 0; p < XT_P; p++) {
             cpx bs[XT_N], bc[XT_N];
             for (int i = 0; i < XT_N; i++) {
