@@ -402,7 +402,11 @@ src_interp(const float *hist, double phase)
 
 /* Mixer gain byte: 0x08 = unity, about 0.75 dB per step (signed), 0x80 =
    mute. Measured on the input side through DirectSound volume; the
-   output side is assumed to follow the same law. */
+   output side is assumed to follow the same law. Above unity only 0x0a
+   (+1.5 dB, the canceller's inputs) is known; Half-Life ramps the second
+   wavetable bank's input to 0x1f, which at +17 dB would swamp the 3D sound
+   and clip, while a real card's mix stays dominated by it. So the gain
+   saturates at 0x0a. */
 static float mix_gain_tab[256];
 
 static void
@@ -418,8 +422,8 @@ init_tables(void)
             mix_gain_tab[b] = 0.0f;
         else {
             double db = ((double) (int8_t) b - 8.0) * 0.75;
-            if (db > 24.0)
-                db = 24.0;
+            if (db > 1.5)
+                db = 1.5;
             mix_gain_tab[b] = (float) pow(10.0, db / 20.0);
         }
     }
