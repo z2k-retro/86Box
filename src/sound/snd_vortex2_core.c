@@ -1840,7 +1840,9 @@ v2_read(v2_chip_t *c, uint32_t addr)
             /* Channels the driver has not used yet: the real card reports
                ADB channels idle (0x0050p000) and wavetable channels as
                0x000ff000 (Half-Life trace). */
-            if (addr >= WTDMA_STAT && addr < WTDMA_STAT + NR_WTDMA * 4)
+            if (addr == 0x2205c)
+                v = R(addr) | 1;
+            else if (addr >= WTDMA_STAT && addr < WTDMA_STAT + NR_WTDMA * 4)
                 v = c->wt[(addr - WTDMA_STAT) >> 2].touched ? dma_stat(c, &c->wt[(addr - WTDMA_STAT) >> 2]) : 0x000ff000;
             else if (addr >= ADBDMA_STAT && addr < ADBDMA_STAT + NR_ADBDMA * 4)
                 v = c->adb[(addr - ADBDMA_STAT) >> 2].touched ? dma_stat(c, &c->adb[(addr - ADBDMA_STAT) >> 2]) : 0x00500000;
@@ -1975,6 +1977,15 @@ v2_reset(v2_chip_t *c)
         }
     }
     R(CODEC_CTRL) = 0x00008100;
+    /* 0x22034 reads 0xff whatever is written (every real trace: written 0,
+       read 0xff). The driver write-tests it at start-up; when it held the
+       values, the driver took that as extra hardware and, among other
+       things, advertised 16 3D buffers instead of 76 and 7 stereo 3D
+       sources instead of 9 (Minerva). 0x2205c (SPDIF_FLAGS) starts at
+       0x138015 and keeps bit 0 set when written (0x13801c reads 0x13801d). */
+    R(0x22034) = 0x000000ff;
+    c->ro[(0x22034 >> 2) >> 3] |= 1 << ((0x22034 >> 2) & 7);
+    R(0x2205c) = 0x00138015;
     c->last_bus   = 0xdeadbabe;
     c->irq_src    = R(IRQ_SOURCE) & ~IRQ_ALWAYS;
     c->irq_level  = 0;
