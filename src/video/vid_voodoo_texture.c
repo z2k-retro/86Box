@@ -72,10 +72,14 @@ voodoo_texture_in_use(const voodoo_t *voodoo, const texture_t *tex)
 uint32_t
 voodoo_tmu_texture_size_bytes(const voodoo_t *voodoo, int tmu)
 {
-    uint32_t texture_size = (uint32_t) voodoo->texture_size << 20;
-
+    /* Banshee and Voodoo3 texture from the shared frame buffer: their init
+       sets texture_mask from the VRAM size and leaves texture_size at 0, so
+       using texture_size here gave a mask of 0xffffffff and let texture
+       fetches run past the end of VRAM (Slave Zero crashed 86Box). */
     if (voodoo->type >= VOODOO_BANSHEE)
-        return texture_size;
+        return voodoo->texture_mask + 1;
+
+    uint32_t texture_size = (uint32_t) voodoo->texture_size << 20;
 
     uint32_t tmu_limit = 2u << 20;
     if ((voodoo->trexInit0[tmu] & TREXINIT0_TEXTURE_MEMORY_SECOND_RAS_ENABLE) &&
