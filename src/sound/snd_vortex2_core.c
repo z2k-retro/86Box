@@ -1851,7 +1851,10 @@ v2_read(v2_chip_t *c, uint32_t addr)
             else if (addr >= FIFO_WTCTRL && addr < FIFO_ADBCTRL + NR_ADBDMA * 4) {
                 int       wt = addr < FIFO_ADBCTRL;
                 v2_dma_t *d  = wt ? &c->wt[(addr - FIFO_WTCTRL) >> 2] : &c->adb[(addr - FIFO_ADBCTRL) >> 2];
-                v            = R(addr) & ~FIFO_EMPTY;
+                /* Only bits 19-0 read back: the top bits of the driver's
+                   stop sequence (0x1c4xxxxx, then 0x0c4xxxxx) are commands
+                   and never appear in a real card's reads. */
+                v            = R(addr) & 0x000fffff & ~FIFO_EMPTY;
                 /* An idle channel reads back "empty" (0x20); one whose control
                    word has bit 13 set (0x42000, the driver's stereo/16-bit set-up)
                    also reads 0x40 (every real trace: 0x41000 -> 0x41020,
