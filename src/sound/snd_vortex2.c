@@ -76,12 +76,13 @@ typedef struct vortex2_t {
     int   cd_filter;
     /* CD audio on its way into the codec's ADC: 44.1 kHz frames written by
        86Box's CD-audio thread, read by the emulation thread. */
-#define CD_RING 8192
+#define CD_RING 16384
     int16_t           cd_ring[CD_RING][2];
     volatile uint32_t cd_wr, cd_rd;
     int16_t           cd_pend;
     double            cd_phase;
     float             cd_prev[2], cd_cur[2];
+    int               cd_primed; /* enough buffered to play without gaps */
     FILE *logf;
     FILE *tracef; /* register trace, same format as the real-card sessions */
     FILE *dmaf;   /* sample data the chip fetched: u32 addr, u32 len, bytes */
@@ -278,22 +279,31 @@ host_codec_adc(void *priv, float *l, float *r, int n)
     float      gr  = (rg & 0x8000) || (sel & 7) != 1 ? 0.0f : powf(10.0f, (rg & 15) * 1.5f / 20.0f) / 32768.0f;
     uint32_t   avail = dev->cd_wr - dev->cd_rd;
 
-    /* Keep the buffer short: CD audio arrives in bursts from another
-       thread, so drop a backlog rather than let the delay grow. */
-    if (avail > 4096)
-        dev->cd_rd = dev->cd_wr - 2048;
+    /* CD audio arrives from 86Box's CD thread in chunks of 100 ms
+       (CD_BUFLEN), at times late. Hold about 136 ms in reserve before
+       playing, and start
+       over if it runs dry, so a late chunk does not leave gaps; drop only
+       a large backlog, so the delay stays short. */
+    if (avail > 13000) {
+        dev->cd_rd = dev->cd_wr - 6000;
+        avail      = 6000;
+    }
+    if (!dev->cd_primed && avail >= 6000)
+        dev->cd_primed = 1;
     for (int i = 0; i < n; i++) {
         dev->cd_phase += 44100.0 / 48000.0;
         while (dev->cd_phase >= 1.0) {
             dev->cd_phase -= 1.0;
             dev->cd_prev[0] = dev->cd_cur[0];
             dev->cd_prev[1] = dev->cd_cur[1];
-            if (dev->cd_wr != dev->cd_rd) {
+            if (dev->cd_primed && dev->cd_wr != dev->cd_rd) {
                 dev->cd_cur[0] = dev->cd_ring[dev->cd_rd % CD_RING][0];
                 dev->cd_cur[1] = dev->cd_ring[dev->cd_rd % CD_RING][1];
                 dev->cd_rd++;
-            } else
-                dev->cd_cur[0] = dev->cd_cur[1] = 0.0f; /* nothing playing */
+            } else {
+                dev->cd_primed = 0; /* ran dry (or nothing playing): refill first */
+                dev->cd_cur[0] = dev->cd_cur[1] = 0.0f;
+            }
         }
         float f = (float) dev->cd_phase;
         l[i] = (dev->cd_prev[0] + (dev->cd_cur[0] - dev->cd_prev[0]) * f) * gl;
