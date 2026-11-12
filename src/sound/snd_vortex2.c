@@ -74,6 +74,14 @@ typedef struct vortex2_t {
     int   rear_mix;
     int   log_routes;
     int   cd_filter;
+    /* CD audio on its way into the codec's ADC: 44.1 kHz frames written by
+       86Box's CD-audio thread, read by the emulation thread. */
+#define CD_RING 8192
+    int16_t           cd_ring[CD_RING][2];
+    volatile uint32_t cd_wr, cd_rd;
+    int16_t           cd_pend;
+    double            cd_phase;
+    float             cd_prev[2], cd_cur[2];
     FILE *logf;
     FILE *tracef; /* register trace, same format as the real-card sessions */
     FILE *dmaf;   /* sample data the chip fetched: u32 addr, u32 len, bytes */
@@ -215,6 +223,21 @@ vortex2_filter_cd_audio(int channel, double *buffer, void *priv)
         *buffer = 0.0;
         return;
     }
+    /* The codec also digitises the CD input when its record select picks
+       CD; the Aureal driver plays CD audio that way (it mutes the analog CD
+       path, register 0x12, and routes the ADC through the Vortex mixer). */
+    {
+        vortex2_t *d = (vortex2_t *) priv;
+        double     v = *buffer;
+        int16_t    sv = (int16_t) (v > 32767.0 ? 32767 : v < -32768.0 ? -32768 : v);
+        if (channel == 0)
+            d->cd_pend = sv;
+        else if (d->cd_wr - d->cd_rd < CD_RING) {
+            d->cd_ring[d->cd_wr % CD_RING][0] = d->cd_pend;
+            d->cd_ring[d->cd_wr % CD_RING][1] = sv;
+            d->cd_wr++;
+        }
+    }
     ac97_codec_getattn(dev->codec, 0x12, &cl, &cr);
     ac97_codec_getattn(dev->codec, 0x02, &ml, &mr);
     *buffer *= channel ? ((double) cr * mr / (32768.0 * 32768.0)) : ((double) cl * ml / (32768.0 * 32768.0));
@@ -238,6 +261,43 @@ host_codec_write(void *priv, uint8_t reg, uint16_t val)
             sound_set_cd_audio_filter(vortex2_filter_cd_audio, dev);
             dev->cd_filter = 1;
         }
+    }
+}
+
+/* The codec's ADC input for one block: CD audio, resampled from 44.1 to
+   48 kHz, when the record select (0x1a) picks CD (source 1), after the
+   record gain (0x1c: 1.5 dB steps from 0 dB, bit 15 mutes). Other record
+   sources are not emulated. */
+static void
+host_codec_adc(void *priv, float *l, float *r, int n)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+    uint16_t   sel = dev->codec ? ac97_codec_readw(dev->codec, 0x1a) : 0;
+    uint16_t   rg  = dev->codec ? ac97_codec_readw(dev->codec, 0x1c) : 0x8000;
+    float      gl  = (rg & 0x8000) || ((sel >> 8) & 7) != 1 ? 0.0f : powf(10.0f, ((rg >> 8) & 15) * 1.5f / 20.0f) / 32768.0f;
+    float      gr  = (rg & 0x8000) || (sel & 7) != 1 ? 0.0f : powf(10.0f, (rg & 15) * 1.5f / 20.0f) / 32768.0f;
+    uint32_t   avail = dev->cd_wr - dev->cd_rd;
+
+    /* Keep the buffer short: CD audio arrives in bursts from another
+       thread, so drop a backlog rather than let the delay grow. */
+    if (avail > 4096)
+        dev->cd_rd = dev->cd_wr - 2048;
+    for (int i = 0; i < n; i++) {
+        dev->cd_phase += 44100.0 / 48000.0;
+        while (dev->cd_phase >= 1.0) {
+            dev->cd_phase -= 1.0;
+            dev->cd_prev[0] = dev->cd_cur[0];
+            dev->cd_prev[1] = dev->cd_cur[1];
+            if (dev->cd_wr != dev->cd_rd) {
+                dev->cd_cur[0] = dev->cd_ring[dev->cd_rd % CD_RING][0];
+                dev->cd_cur[1] = dev->cd_ring[dev->cd_rd % CD_RING][1];
+                dev->cd_rd++;
+            } else
+                dev->cd_cur[0] = dev->cd_cur[1] = 0.0f; /* nothing playing */
+        }
+        float f = (float) dev->cd_phase;
+        l[i] = (dev->cd_prev[0] + (dev->cd_cur[0] - dev->cd_prev[0]) * f) * gl;
+        r[i] = (dev->cd_prev[1] + (dev->cd_cur[1] - dev->cd_prev[1]) * f) * gr;
     }
 }
 
@@ -674,6 +734,7 @@ vortex2_init(UNUSED(const device_t *info))
     host.codec_read  = host_codec_read;
     host.codec_write = host_codec_write;
     host.log         = host_log;
+    host.codec_adc   = host_codec_adc;
 
     timer_add(&dev->irq_timer, vortex2_irq_timer, dev, 0);
 

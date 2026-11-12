@@ -125,6 +125,7 @@
 #define AS_MIXOUT  0x30
 #define AS_WT0     0x40
 #define AS_XTOUT   0x66
+#define AS_CODECIN 0x70 /* codec ADC, left and right */
 #define AS_EQOUT   0x7e
 #define AS_WT1     0x80
 #define AS_A3DOUT  0xa6
@@ -271,6 +272,8 @@ struct v2_chip_t {
     uint8_t  a3d_cur_dirty[NR_A3D];
     uint8_t  a3d_tgt_dirty[NR_A3D]; /* a target or glide-rate word was written */
     int16_t  src_owner[NR_SRC]; /* source each converter last converted */
+    float    adc[2][B];         /* codec ADC input for this block */
+    int      adc_done;
     uint8_t  a3d_used[NR_A3D];
     uint32_t graph_hash;
     uint32_t glide_frames; /* sample count for the 64-sample glide tick */
@@ -1777,6 +1780,15 @@ eval_src(v2_chip_t *c, int a)
         if (!c->eq_done)
             eq_run(c);
         memcpy(o, c->eq_out[a - AS_EQOUT], sizeof(float) * B);
+    } else if (a == AS_CODECIN || a == AS_CODECIN + 1) {
+        if (!c->adc_done) {
+            if (c->host.codec_adc)
+                c->host.codec_adc(c->host.priv, c->adc[0], c->adc[1], B);
+            else
+                memset(c->adc, 0, sizeof(c->adc));
+            c->adc_done = 1;
+        }
+        memcpy(o, c->adc[a - AS_CODECIN], sizeof(float) * B);
     } else if (a >= AS_A3DOUT && a < AS_A3DOUT + 8) {
         if (!c->a3d_done)
             a3d_run(c);
@@ -1833,7 +1845,7 @@ v2_run_block(v2_chip_t *c, float *out)
     memset(c->sstate, 0, sizeof(c->sstate));
     memset(c->kstate, 0, sizeof(c->kstate));
     c->wt_done[0] = c->wt_done[1] = 0;
-    c->a3d_done = c->xt_done = c->eq_done = 0;
+    c->a3d_done = c->xt_done = c->eq_done = c->adc_done = 0;
     c->glide_frames += B;
     mix_ramp(c);
 

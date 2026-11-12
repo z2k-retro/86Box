@@ -42,6 +42,11 @@ typedef struct v2_host_t {
     void (*codec_write)(void *priv, uint8_t reg, uint16_t val);
     /* Optional log sink (may be NULL). */
     void (*log)(void *priv, const char *msg);
+    /* Optional: the codec's ADC input (what its record select picks, after
+       record gain) for one block of V2_BLOCK samples at 48 kHz, left and
+       right. The driver routes it (ADB sources 0x70/0x71) through the
+       mixer: that is how CD audio reaches the output on an SQ2500. */
+    void (*codec_adc)(void *priv, float *left, float *right, int n);
 } v2_host_t;
 
 typedef struct v2_chip_t v2_chip_t;
