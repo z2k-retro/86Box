@@ -1008,7 +1008,7 @@ src_run(v2_chip_t *c, int s, float *out)
        rather than play it late (heard as a burst of the previous sound's
        tail after silence). */
     uint32_t now = c->glide_frames + 1;
-    if (st->last_run != now && st->last_run + B != now) {
+    if (st->last_run && st->last_run != now && st->last_run + B != now) {
         if (st->nin < d->frame_no)
             st->nin = d->frame_no;
         memset(st->hist, 0, sizeof(st->hist));
