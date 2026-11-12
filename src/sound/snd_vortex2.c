@@ -278,9 +278,11 @@ host_codec_write(void *priv, uint8_t reg, uint16_t val)
    scale left the music about 14 dB above the game sound in the Half-Life
    tram ride and clipping, where real-card recordings have it beneath the
    game sound; the "cd_level" option sets the drive's output against codec
-   full scale. The default, -8 dB, is the cut that sounded right by ear
-   against the game as played on a real card (the Windows CD slider
-   moved from mixer gain 0x00 to 0xf5, 8.25 dB). */
+   full scale. The default, -12 dB, matches the balance of the current
+   Steam release: with the track located in recordings, the music sits
+   about 7 dB below the game sound there, against about 6 dB above in
+   86Box at 0 dB with the CD mixer inputs at 0x00. A YouTube recording of
+   the CD release gave 18 dB and a rough listening test 8 dB. */
 static void
 host_codec_adc(void *priv, float *l, float *r, int n)
 {
@@ -821,14 +823,14 @@ static const device_config_t vortex2_config[] = {
         .description    = "CD audio input level",
         .type           = CONFIG_SELECTION,
         .default_string = NULL,
-        .default_int    = -8,
+        .default_int    = -12,
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = {
             { .description = "0 dB (drive at codec full scale)", .value =   0 },
             { .description = "-4 dB",                            .value =  -4 },
-            { .description = "-8 dB (default)",                  .value =  -8 },
-            { .description = "-12 dB",                           .value = -12 },
+            { .description = "-8 dB",                            .value =  -8 },
+            { .description = "-12 dB (default)",                 .value = -12 },
             { .description = "-18 dB",                           .value = -18 },
             { .description = "-24 dB",                           .value = -24 },
             { .description = ""                                               }
