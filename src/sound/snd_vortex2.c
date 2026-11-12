@@ -83,6 +83,7 @@ typedef struct vortex2_t {
     double            cd_phase;
     float             cd_prev[2], cd_cur[2];
     int               cd_primed; /* enough buffered to play without gaps */
+    float             cd_level;  /* drive's analog output against codec full scale */
     FILE *logf;
     FILE *tracef; /* register trace, same format as the real-card sessions */
     FILE *dmaf;   /* sample data the chip fetched: u32 addr, u32 len, bytes */
@@ -268,15 +269,25 @@ host_codec_write(void *priv, uint8_t reg, uint16_t val)
 /* The codec's ADC input for one block: CD audio, resampled from 44.1 to
    48 kHz, when the record select (0x1a) picks CD (source 1), after the
    record gain (0x1c: 1.5 dB steps from 0 dB, bit 15 mutes). Other record
-   sources are not emulated. */
+   sources are not emulated.
+
+   The CD reaches the card as an analog signal, and the driver sets the
+   record gain to +12 dB on the real card too, so the level depends on the
+   drive's line output and the card's input stage, which have not been
+   measured. Taking the drive's digital full scale as the codec's full
+   scale left the music about 14 dB above the game sound in the Half-Life
+   tram ride and clipping, where real-card recordings have it beneath the
+   game sound; the "cd_level" option sets the drive's output against codec
+   full scale, -12 dB by default (an estimate). */
 static void
 host_codec_adc(void *priv, float *l, float *r, int n)
 {
     vortex2_t *dev = (vortex2_t *) priv;
     uint16_t   sel = dev->codec ? ac97_codec_readw(dev->codec, 0x1a) : 0;
     uint16_t   rg  = dev->codec ? ac97_codec_readw(dev->codec, 0x1c) : 0x8000;
-    float      gl  = (rg & 0x8000) || ((sel >> 8) & 7) != 1 ? 0.0f : powf(10.0f, ((rg >> 8) & 15) * 1.5f / 20.0f) / 32768.0f;
-    float      gr  = (rg & 0x8000) || (sel & 7) != 1 ? 0.0f : powf(10.0f, (rg & 15) * 1.5f / 20.0f) / 32768.0f;
+    float      k   = dev->cd_level / 32768.0f;
+    float      gl  = (rg & 0x8000) || ((sel >> 8) & 7) != 1 ? 0.0f : powf(10.0f, ((rg >> 8) & 15) * 1.5f / 20.0f) * k;
+    float      gr  = (rg & 0x8000) || (sel & 7) != 1 ? 0.0f : powf(10.0f, (rg & 15) * 1.5f / 20.0f) * k;
     uint32_t   avail = dev->cd_wr - dev->cd_rd;
 
     /* CD audio arrives from 86Box's CD thread in chunks of 100 ms
@@ -714,6 +725,7 @@ vortex2_init(UNUSED(const device_t *info))
 
     dev->rear_mix   = device_get_config_int("rear_mix");
     dev->log_routes = device_get_config_int("log");
+    dev->cd_level   = powf(10.0f, device_get_config_int("cd_level") / 20.0f);
     if (dev->log_routes) {
         /* Its own file in the machine's folder, so it works in release
            builds and without command-line options. */
@@ -800,6 +812,24 @@ static const device_config_t vortex2_config[] = {
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "cd_level",
+        .description    = "CD audio input level",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = -12,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "0 dB (drive at codec full scale)", .value =   0 },
+            { .description = "-6 dB",                            .value =  -6 },
+            { .description = "-12 dB (default)",                 .value = -12 },
+            { .description = "-18 dB",                           .value = -18 },
+            { .description = "-24 dB",                           .value = -24 },
+            { .description = ""                                               }
+        },
         .bios           = { { 0 } }
     },
     {
