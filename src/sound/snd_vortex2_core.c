@@ -171,6 +171,7 @@ typedef struct v2_dma_t {
     uint32_t frame_no;
     uint32_t rate_acc; /* capture: phase accumulator (16.16) */
     uint32_t since_fetch; /* samples taken from the FIFO since the last fetch */
+    uint32_t drain_end;   /* glide_frames when a stopped voice's FIFO has played out */
 } v2_dma_t;
 
 typedef struct v2_route_t {
@@ -784,7 +785,7 @@ dma_stat(v2_chip_t *c, v2_dma_t *d)
                once it is empty it reports idle (0x00501000), and the driver
                waits for that before it returns the buffer to Windows. A model
                that never went idle left system sounds stuck "playing". */
-            if (d->fn > 0)
+            if (d->fn > 0 || (d->stopped && (int32_t) (d->drain_end - c->glide_frames) > 0))
                 return ((uint32_t) d->page << 12) | ((d->since_fetch > 0x3f ? 0x3f : d->since_fetch) << 14);
             return 0x00500000 | ((uint32_t) d->page << 12);
         default:
@@ -838,6 +839,18 @@ fifo_ctrl_write(v2_chip_t *c, v2_dma_t *d, uint32_t old, uint32_t val)
         if (d->state == DMA_RUN || d->state == DMA_STALL) {
             d->state   = d->fn > 0 ? DMA_END : DMA_IDLE;
             d->stopped = 1;
+            if (d->is_wt) {
+                /* The real card keeps a voice's FIFO nearly full (64 samples) and plays
+                   it out after a stop, at the voice's rate: it reports
+                   draining for that long (median 5.5 ms in Half-Life, whose
+                   voices run at 11 and 22 kHz) before going idle. */
+                uint32_t p = R((d->ch >> 5) * WT_BANK_STRIDE + WT_PARM + (d->ch & 31) * 0x10);
+                double   step = pow(2.0, (double) ((p >> 13) & 7) - 5.0) * (1.0 + (p & 0x1fff) / 8192.0);
+                if (step < 0.05)
+                    step = 0.05;
+                d->drain_end = c->glide_frames + (uint32_t) (56.0 / step);
+                d->state     = DMA_END;
+            }
         } else if (d->state != DMA_END)
             d->state = DMA_IDLE;
     }
