@@ -172,6 +172,7 @@ typedef struct v2_dma_t {
     uint32_t rate_acc; /* capture: phase accumulator (16.16) */
     uint32_t since_fetch; /* samples taken from the FIFO since the last fetch */
     uint32_t drain_end;   /* glide_frames when a stopped voice's FIFO has played out */
+    uint8_t  primed;      /* initial prefetch done since the stream started */
 } v2_dma_t;
 
 typedef struct v2_route_t {
@@ -579,6 +580,7 @@ static void
 dma_begin(v2_chip_t *c, v2_dma_t *d)
 {
     d->touched  = 1;
+    d->primed   = 0;
     d->frd      = 0;
     d->fn       = 0;
     d->frame_no = 0;
@@ -623,6 +625,8 @@ dma_fill(v2_chip_t *c, v2_dma_t *d, uint32_t need)
             n = sizeof(tmp);
         if (n > FIFO_LEN - d->fn)
             n = FIFO_LEN - d->fn;
+        if (n > need - d->fn)
+            n = need - d->fn; /* fetch what was asked for, like the card */
         if (n == 0)
             return;
         c->host.mem_read(c->host.priv, R(dma_base(d) + d->page * 4) + d->pos, tmp, n);
@@ -685,8 +689,17 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
         nch = 1;
     if (nch > 4)
         nch = 4;
+    /* The card prefetches 56 samples when a stream starts and then fetches
+       18 samples each time 18 have been played (real-card status reads:
+       position 0x070 within 0.15 ms of a 16-bit start, then +0x24 steps
+       while the samples-since-fetch field cycles 0..17). The driver reads
+       both fields to find the play position, so fetch the same way. */
+    if (!d->primed) {
+        d->primed = 1;
+        dma_fill(c, d, 56 * bps);
+    }
     if (d->fn < (uint32_t) (nch * bps))
-        dma_fill(c, d, 64);
+        dma_fill(c, d, d->fn + (uint32_t) (18 * bps > nch * bps ? 18 * bps : nch * bps)); /* ran dry */
     if (d->fn < (uint32_t) (nch * bps)) {
         if (d->state == DMA_END)
             d->fn = 0; /* a finished stream's last partial frame: drained */
@@ -712,6 +725,8 @@ dma_next_frame(v2_chip_t *c, v2_dma_t *d, int nch)
     }
     d->since_fetch += nch;
     d->frame_no++;
+    if (d->since_fetch >= 18)
+        dma_fill(c, d, d->fn + 18 * bps);
 }
 
 /* A consumer (route, converter, voice) takes sample idx of its next
