@@ -18,9 +18,9 @@
  *          PCI configuration values were read from an SQ2500 (AU8830,
  *          revision 0xfa).
  *
- * Authors: Zvi Rosen and contributors.
+ * Authors: Z2k Retro and contributors.
  *
- *          Copyright 2026 Zvi Rosen.
+ *          Copyright 2026 Z2k Retro.
  */
 #include <stdarg.h>
 #include <stdint.h>

@@ -13,9 +13,9 @@
  *          (driver 4.06.2048), used because the canceller's register-level
  *          arithmetic is not yet decoded.
  *
- * Authors: Zvi Rosen and contributors.
+ * Authors: Z2k Retro and contributors.
  *
- *          Copyright 2026 Zvi Rosen.
+ *          Copyright 2026 Z2k Retro.
  */
 #ifndef SND_VORTEX2_TABLES_H
 #define SND_VORTEX2_TABLES_H
