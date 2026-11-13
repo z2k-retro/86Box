@@ -483,16 +483,33 @@ vortex2_mmio_writeb(uint32_t addr, uint8_t val, void *priv)
 }
 
 /* ------------------------------------------------------------------ */
-/* BAR1: index (+0) / data (+4) window onto the same registers. The   */
-/* Windows driver uses it only during early initialisation.           */
-/* BAR2: purpose unknown; the driver writes 0x10/0x00 to +4 and reads */
-/* +6 (0xff) once at boot.                                            */
+/* BAR1: address (+0) / data (+4) window onto the same registers. The */
+/* Windows driver uses it only during early initialisation. With the  */
+/* chip control register's auto-increment bit (0x2a00c bit 19) set,   */
+/* address bits 9-2 step by one register after each data access (for  */
+/* the Sound Blaster TSR's reads of the FM register image).           */
+/* BAR2: the modem side of the parallel interface, for the SQ3500's   */
+/* daughterboard: eight byte registers laid out like a 16550 UART's.  */
+/* The driver sets loopback (0x10 to +4, the modem control register)  */
+/* and reads the modem status at +6; with nothing fitted it reads     */
+/* 0xff, as on the SQ2500.                                            */
 /* ------------------------------------------------------------------ */
+
+static void
+io1_step(vortex2_t *dev)
+{
+    if (v2_read(dev->chip, 0x2a00c) & (1u << 19))
+        dev->index = (dev->index & ~0x3fcu) | ((dev->index + 4) & 0x3fcu);
+}
 
 static uint32_t
 io1_get(vortex2_t *dev, uint16_t port)
 {
-    return (port & 4) ? tr_read(dev, dev->index & 0x3fffc) : dev->index;
+    if (!(port & 4))
+        return dev->index;
+    uint32_t v = tr_read(dev, dev->index & 0x3fffc);
+    io1_step(dev);
+    return v;
 }
 
 static void
@@ -502,6 +519,7 @@ io1_put(vortex2_t *dev, uint16_t port, uint32_t val, uint32_t mask)
         uint32_t a   = dev->index & 0x3fffc;
         uint32_t old = (mask == 0xffffffff) ? 0 : v2_read(dev->chip, a);
         tr_write(dev, a, (old & ~mask) | (val & mask));
+        io1_step(dev);
     } else
         dev->index = (dev->index & ~mask) | (val & mask);
 }
