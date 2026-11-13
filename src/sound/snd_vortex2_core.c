@@ -413,15 +413,19 @@ src_interp(const float *hist, double phase)
 }
 
 /* Mixer gain byte: a signed 5-bit exponent (bits 7-3) and a 3-bit
-   mantissa (bits 2-0) with an implied leading one, so 0x08 = unity, each
-   exponent step is 6.02 dB and 0x80 is mute (Plausible: a register map of
-   the chip describes this layout; measured on a real card through
-   DirectSound volume at 0x08, 0x00, 0xf8, 0xe8 and 0xc8, which this law
-   and a plain 0.75 dB per step both fit, -48.2 dB at 0xc8 slightly better
-   here). Above unity it simply amplifies: Half-Life's 0x1f on the second
-   wavetable bank's send buses is +17.5 dB, and makes up for those buses'
-   headroom (see wt_bank_run). */
+   mantissa (bits 2-0), the fixed-point number .1MMM x 2^EXP: 0x08 =
+   unity, 0x2f = .1111 x 2^5 = 30 (+29.5 dB) is the largest gain, 0x80 =
+   .1 x 2^-16 (-102.4 dB) is mute; steps average 0.75 dB (Aureal's
+   description of the mixer, relayed with a register map of the chip;
+   the real card's measured gains at 0x08, 0x00, 0xf8, 0xe8 and 0xc8 fit
+   it). Codes above 0x2f are outside the documented range; the model
+   holds them at exponent 5. Half-Life's 0x1f on the second wavetable
+   bank's send buses is +17.5 dB and makes up for those buses' headroom
+   (see wt_bank_run). Mute is taken as zero: -102 dB is below the
+   16-bit output's last bit. mix_mant_tab and mix_exp_tab split the
+   output gains for the output stage (see mix_run). */
 static float mix_gain_tab[256];
+static float mix_mant_tab[256], mix_shift_tab[256];
 
 static void
 init_tables(void)
@@ -433,10 +437,14 @@ init_tables(void)
     init_src_fir();
     for (int b = 0; b < 256; b++) {
         if (b == 0x80)
-            mix_gain_tab[b] = 0.0f;
+            mix_gain_tab[b] = mix_mant_tab[b] = mix_shift_tab[b] = 0.0f;
         else {
             int e = (int8_t) b >> 3, m = b & 7;
-            mix_gain_tab[b] = (float) ldexp(1.0 + m / 8.0, e - 1);
+            if (e > 5)
+                e = 5;
+            mix_mant_tab[b]  = (float) (0.5 + m / 16.0);
+            mix_shift_tab[b] = (float) ldexp(1.0, e);
+            mix_gain_tab[b]  = mix_mant_tab[b] * mix_shift_tab[b];
         }
     }
     done = 1;
@@ -1079,7 +1087,12 @@ src_run(v2_chip_t *c, int s, float *out)
 }
 
 /* Mixer output: sum of enabled inputs times their gains, times the
-   output gain. Current gains glide toward their targets. */
+   output gain. Current gains glide toward their targets. The hardware
+   sums with 5 bits of headroom and clamps the sum at +-32 (full scale =
+   1); the output gain is applied as its exponent shift, clamped at +-2,
+   then its mantissa (.1MMM, 0.5-0.94), and the result is clamped to
+   full scale (Aureal's description of the mixer pipeline). At unity
+   output gain that is a clamp of the sum at full scale. */
 static void
 mix_ramp(v2_chip_t *c)
 {
@@ -1113,9 +1126,16 @@ mix_run(v2_chip_t *c, int m, float *out)
         for (int n = 0; n < B; n++)
             out[n] += g * in[n];
     }
-    float og = mix_gain_tab[R(MIX_VOL_B + m * 4) & 0xff];
-    for (int n = 0; n < B; n++)
-        out[n] *= og;
+    uint8_t     ob = R(MIX_VOL_B + m * 4) & 0xff;
+    const float sh = mix_shift_tab[ob], mt = mix_mant_tab[ob];
+    for (int n = 0; n < B; n++) {
+        float v = out[n];
+        v = v > 32.0f ? 32.0f : (v < -32.0f ? -32.0f : v);
+        v *= sh;
+        v = v > 2.0f ? 2.0f : (v < -2.0f ? -2.0f : v);
+        v *= mt;
+        out[n] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+    }
 }
 
 /* ------------------------------------------------------------------ */
