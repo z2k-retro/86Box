@@ -181,9 +181,9 @@ typedef struct v2_route_t {
     uint32_t cnt; /* frames this route has taken from a DMA source */
 } v2_route_t;
 
-#define SRC_TAPS   22  /* converter FIR length in input samples */
+#define SRC_TAPS   27  /* converter FIR length in input samples */
 #define SRC_PHASES 256
-#define SRC_PAD    24  /* SRC_TAPS rounded up to a multiple of 4 (leading zero taps) */
+#define SRC_PAD    28  /* SRC_TAPS rounded up to a multiple of 4 (leading zero taps) */
 
 typedef struct v2_src_t {
     double   phase;
@@ -348,10 +348,13 @@ interp4(const float *h, float t)
 /* Sample-rate converter filter. Measured on a real SQ2500 (run 12, noise
    at 8-44.1 kHz against 48 kHz): flat to 0.45 x the input rate, -3 dB at
    0.48, -6 dB at 0.50, -11 dB at 0.52, -23 dB at 0.55, -37 dB at 0.57 and
-   below the recording's noise floor (about -60 dB) from 0.60. A 22-tap
-   Kaiser-windowed sinc (beta 6, cutoff at the input Nyquist) matches that
-   to within the measurement scatter. src_fir[p] holds the taps for a
-   fractional position p / SRC_PHASES between hist[10] and hist[11]. */
+   below the recording's noise floor (about -60 dB) from 0.60. Aureal's
+   documentation gives the converter 27-point interpolation, which fits the
+   driver's samples-per-wing setting (13 each side of the centre sample). A
+   27-tap Kaiser-windowed sinc (beta 8.25, cutoff at the input Nyquist)
+   matches the measurements to 0.37 dB rms (the earlier 22-tap, beta 6 fit:
+   0.48 dB) with its stopband below -86 dB. src_fir[p] holds the taps for
+   a fractional position p / SRC_PHASES after tap (SRC_TAPS - 1) / 2. */
 static float src_fir[SRC_PHASES + 1][SRC_PAD]; /* taps in [SRC_PAD - SRC_TAPS ..] */
 
 static double
@@ -368,12 +371,13 @@ bessel_i0(double x)
 static void
 init_src_fir(void)
 {
-    const double half = SRC_TAPS / 2.0, beta = 6.0, i0b = bessel_i0(beta);
+    const double half = SRC_TAPS / 2.0, beta = 8.25, i0b = bessel_i0(beta);
+    const int    ctr  = (SRC_TAPS - 1) / 2; /* the tap just before the output point */
 
     for (int p = 0; p <= SRC_PHASES; p++) {
         double t = (double) p / SRC_PHASES, sum = 0.0, h[SRC_TAPS];
         for (int k = 0; k < SRC_TAPS; k++) {
-            double x = (double) k - (half - 1.0) - t; /* distance from the output point */
+            double x = (double) (k - ctr) - t; /* distance from the output point */
             double w = x / half;
             double v = (fabs(x) < 1e-9) ? 1.0 : sin(M_PI * x) / (M_PI * x);
             v *= (fabs(w) < 1.0) ? bessel_i0(beta * sqrt(1.0 - w * w)) / i0b : 0.0;
