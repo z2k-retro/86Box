@@ -412,13 +412,15 @@ src_interp(const float *hist, double phase)
     return sa + (sb - sa) * f;
 }
 
-/* Mixer gain byte: 0x08 = unity, about 0.75 dB per step (signed), 0x80 =
-   mute. Measured on the input side through DirectSound volume; the
-   output side is assumed to follow the same law. Above unity only 0x0a
-   (+1.5 dB, the canceller's inputs) is known; Half-Life ramps the second
-   wavetable bank's input to 0x1f, which at +17 dB would swamp the 3D sound
-   and clip, while a real card's mix stays dominated by it. So the gain
-   saturates at 0x0a. */
+/* Mixer gain byte: a signed 5-bit exponent (bits 7-3) and a 3-bit
+   mantissa (bits 2-0) with an implied leading one, so 0x08 = unity, each
+   exponent step is 6.02 dB and 0x80 is mute (Plausible: a register map of
+   the chip describes this layout; measured on a real card through
+   DirectSound volume at 0x08, 0x00, 0xf8, 0xe8 and 0xc8, which this law
+   and a plain 0.75 dB per step both fit, -48.2 dB at 0xc8 slightly better
+   here). Above unity it simply amplifies: Half-Life's 0x1f on the second
+   wavetable bank's send buses is +17.5 dB, and makes up for those buses'
+   headroom (see wt_bank_run). */
 static float mix_gain_tab[256];
 
 static void
@@ -433,10 +435,8 @@ init_tables(void)
         if (b == 0x80)
             mix_gain_tab[b] = 0.0f;
         else {
-            double db = ((double) (int8_t) b - 8.0) * 0.75;
-            if (db > 1.5)
-                db = 1.5;
-            mix_gain_tab[b] = (float) pow(10.0, db / 20.0);
+            int e = (int8_t) b >> 3, m = b & 7;
+            mix_gain_tab[b] = (float) ldexp(1.0 + m / 8.0, e - 1);
         }
     }
     done = 1;
@@ -1131,9 +1131,14 @@ mix_run(v2_chip_t *c, int m, float *out)
 /*   bits 15-0   rate: e = bits 15-13, m = bits 12-0,                  */
 /*               rate = 48 kHz * 2^(e-5) * (1 + m/8192)  (confirmed     */
 /*               against measured DMA consumption)                     */
+/* PARM3: bits 20-14 pan, 13-7 chorus send, 6-0 reverb send (7-bit     */
+/*   levels, 0x7f = full).                                             */
 /* A voice whose own ADB source address (bank base + voice) is routed   */
-/* (the driver routes them to A3D inputs) feeds that source; otherwise */
-/* PARM0's gain sends it to the bank's mixed output 32, PARM1's to 33. */
+/* (the driver routes them to A3D inputs) feeds that source. Otherwise  */
+/* its DSREG bit picks the bank's buses: set = the direct-stream pair   */
+/* 32/33 (PARM0's gain left, PARM1's right); clear = the main pair      */
+/* 34/35 (panned) plus the reverb (36) and chorus (37) sends, which run */
+/* with less headroom (see wt_bank_run).                                */
 /* ------------------------------------------------------------------ */
 
 static inline float
@@ -1171,15 +1176,28 @@ wt_bank_run(v2_chip_t *c, int bank)
     /* Where a voice goes. A voice whose own ADB source (0x40/0x80 + voice)
        is in the routing table plays only into that route: in A3D mode the
        Windows driver feeds 3D inputs that way, and those voices must stay
-       out of the stereo mix. Any other voice goes to one of the half's
-       mixed-output pairs, chosen by its DSREG bit: set = outputs 32/33
-       (Confirmed: test-suite run 16 on a real SQ2500, where clearing the
-       bit under a playing DirectSound voice silenced it, 87 dB down, with
-       only 32/33 routed), clear = outputs 36/37 (Hypothesis: Half-Life
-       routes the second half's 36/37 to the mixer and plays voices 4-29
-       there with DSREG 0). Outputs 34/35 are never fed. */
+       out of the bank's buses. Any other voice goes to buses chosen by its
+       DSREG bit. Set = the direct-stream pair, outputs 32/33 (Confirmed:
+       test-suite run 16 on a real SQ2500, where clearing the bit under a
+       playing DirectSound voice silenced it, 87 dB down, with only 32/33
+       routed). Clear = the main pair 34/35, panned by PARM3, plus the
+       reverb send on 36 and the chorus send on 37, scaled by PARM3's send
+       fields (Plausible: a register map of the chip gives these outputs
+       and fields; Half-Life plays voices 4-29 of the second bank with
+       DSREG 0, routes that bank's 36 to the left mix and 37 to the right,
+       and sets each voice's two send fields per sound).
+       Headroom: the control word (bank + 0) gives the direct-stream pair
+       bits 12-10 and the other buses bits 8-6, each the number of bits
+       the 32-voice sum is shifted up before its top 16 bits are taken.
+       The driver writes 0x1aa3: 6 for the direct-stream pair and 2 for
+       the rest, so the main and send buses run 24 dB below the
+       direct-stream pair, which is the level measured at gain 0xcf. That
+       is why Half-Life turns the send buses' mixer inputs up to 0x1f
+       (+17.5 dB). */
     uint32_t routed = c->wt_routed[bank];
     uint32_t ds     = R(bb + WT_DSREG);
+    uint32_t ctl    = R(bb);
+    float    hs     = ldexpf(1.0f, (int) ((ctl >> 6) & 7) - (int) ((ctl >> 10) & 7));
 
     memset(c->wt_direct[bank], 0, sizeof(c->wt_direct[bank]));
     memset(c->wt_bus[bank], 0, sizeof(c->wt_bus[bank]));
@@ -1200,10 +1218,23 @@ wt_bank_run(v2_chip_t *c, int bank)
         wt_filter_set(w, f);
         int      open = f >= 0xcf;
         int      dir  = (routed >> lv) & 1;
-        int      pair = ((ds >> lv) & 1) ? 0 : 4;
+        int      dsv  = (ds >> lv) & 1;
         float   *od   = c->wt_direct[bank][lv];
-        float   *bl   = c->wt_bus[bank][pair];
-        float   *br   = c->wt_bus[bank][pair + 1];
+        float  **bus  = NULL;
+        float    g4[4] = { gl, gr, 0.0f, 0.0f };
+        float   *b4[4] = { c->wt_bus[bank][0], c->wt_bus[bank][1], NULL, NULL };
+        if (!dir && !dsv) {
+            uint32_t p3  = R(bb + WT_PARM + lv * 0x10 + 12);
+            float    pan = (float) ((p3 >> 14) & 0x7f) / 127.0f;
+            float    g   = gl * hs;
+            g4[0] = g * (1.0f - pan);
+            g4[1] = g * pan;
+            g4[2] = g * (float) (p3 & 0x7f) / 127.0f;
+            g4[3] = g * (float) ((p3 >> 7) & 0x7f) / 127.0f;
+            for (int k = 0; k < 4; k++)
+                b4[k] = c->wt_bus[bank][2 + k];
+        }
+        bus = b4;
 
         float y[B];
         for (int n = 0; n < B; n++) {
@@ -1234,9 +1265,13 @@ wt_bank_run(v2_chip_t *c, int bank)
             for (int n = 0; n < B; n++)
                 od[n] = y[n] * gl;
         else
-            for (int n = 0; n < B; n++) {
-                bl[n] += y[n] * gl;
-                br[n] += y[n] * gr;
+            for (int k = 0; k < 4; k++) {
+                if (!bus[k] || g4[k] == 0.0f)
+                    continue;
+                float  gk = g4[k];
+                float *o  = bus[k];
+                for (int n = 0; n < B; n++)
+                    o[n] += y[n] * gk;
             }
     }
     c->wt_done[bank] = 1;
@@ -1612,8 +1647,17 @@ xt_run(v2_chip_t *c)
     if (c->xt_dirty)
         xt_detect(c);
 
+    /* The model's end-to-end 3D levels (headphone pass-through and the
+       canceller's measured scale) were matched to the real card with the
+       driver's 0x0a on the canceller's mixer inputs taken as +1.5 dB. The
+       exponent/mantissa mixer law makes 0x0a +1.94 dB, so the output is
+       trimmed by the difference to keep those measured levels. */
+    const float trim = 0.950838f; /* 10^(1.5/20) / 1.25 */
+
     if (c->xt.mode == 0) {
-        memcpy(c->xt_out, in, sizeof(in));
+        for (int s = 0; s < 2; s++)
+            for (int n = 0; n < B; n++)
+                c->xt_out[s][n] = in[s][n] * trim;
     } else {
         v2_xt_t *x = &c->xt;
         int      m = x->mode - 1;
@@ -1672,8 +1716,8 @@ xt_run(v2_chip_t *c)
         }
         fft(c, w, 1);
         for (int n = 0; n < B; n++) {
-            c->xt_out[0][n] = w[B + n].re / XT_N;
-            c->xt_out[1][n] = w[B + n].im / XT_N;
+            c->xt_out[0][n] = w[B + n].re * (trim / XT_N);
+            c->xt_out[1][n] = w[B + n].im * (trim / XT_N);
         }
     }
     c->xt_done = 1;
