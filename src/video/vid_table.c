@@ -113,6 +113,7 @@ video_cards[] = {
     { .device = &wy700_device,                                  .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &v6355d_device,                                 .flags = VIDEO_FLAG_TYPE_CGA       },
     /* ISA/ISA16 */
+    { .device = &mga_impression_plus_isa_device,                .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &et4000_isa_device,                             .flags = VIDEO_FLAG_TYPE_NONE      },
     /* ISA16 */
     { .device = &mach64gx_isa_device,                           .flags = VIDEO_FLAG_TYPE_NONE      },
@@ -143,6 +144,7 @@ video_cards[] = {
     { .device = &radius_svga_multiview_mca_device,              .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &et4000_mca_device,                             .flags = VIDEO_FLAG_TYPE_NONE      },
     /* VLB */
+    { .device = &mga_impression_plus_vlb_device,                .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &mach32_vlb_device,                             .flags = VIDEO_FLAG_TYPE_8514      },
     { .device = &mach64gx_vlb_device,                           .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &mach64gx_xpression_vlb_device,                 .flags = VIDEO_FLAG_TYPE_NONE      },

@@ -188,6 +188,7 @@ add_library(vid OBJECT
 
     # Matrox
     vid_mga.c
+    vid_mga_athena.c
 
     # NVidia (pending)
     nv/nv_rivatimer.c
