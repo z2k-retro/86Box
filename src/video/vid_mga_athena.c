@@ -6,8 +6,9 @@
  *
  *          This file is part of the 86Box distribution.
  *
- *          Matrox MGA Impression Plus (MGA ATHENA) ISA / VLB graphics
- *          card with Gouraud-shaded, Z-buffered polygon acceleration.
+ *          Matrox MGA Impression Plus (MGA ATHENA) ISA / VLB / PCI
+ *          graphics card with Gouraud-shaded, Z-buffered polygon
+ *          acceleration.
  *
  *          The card is modelled as an ATHENA in "No DUBIC" mode driving
  *          a TI TVP3026 (ViewPoint) 64-bit RAMDAC directly, which is the
@@ -15,8 +16,10 @@
  *          consists of:
  *            - the ATHENA VGA core (VC-004) with its auxiliary registers
  *              at 3DEh/3DFh;
+ *            - the PCI configuration space (DEVID 0D10102Bh) with the
+ *              relocatable TERMBASE and ROMBASE apertures;
  *            - the 16 KB Power Graphic mode window (ISA map select
- *              AC000h-DC000h) holding the VRAM / pseudo-DMA window, the
+ *              AC000h-DC000h, or TERMBASE on PCI) holding the VRAM / pseudo-DMA window, the
  *              drawing engine and host registers, the memory-mapped VGA
  *              registers and the external device space (RAMDAC, DUBIC,
  *              VIWIC, clock generator);
@@ -67,6 +70,7 @@
 #include <86box/timer.h>
 #include <86box/mem.h>
 #include <86box/rom.h>
+#include <86box/pci.h>
 #include <86box/device.h>
 #include <86box/plat.h>
 #include <86box/video.h>
@@ -121,6 +125,7 @@
 #define REG_FIFOSTATUS 0x1e10
 #define REG_STATUS     0x1e14
 #define REG_ICLEAR     0x1e18
+#define REG_INTSTS     0x1e28
 #define REG_IEN        0x1e1c
 #define REG_RST        0x1e40
 #define REG_TEST       0x1e44
@@ -225,6 +230,14 @@ typedef struct athena_t {
     mem_mapping_t win_mapping;
 
     int      is_vlb;
+    int      is_pci;
+    uint8_t  pci_slot;
+    uint8_t  pci_cmd;
+    uint8_t  pci_option;
+    uint8_t  int_line;
+    uint32_t termbase;
+    uint32_t rombase;
+    uint32_t intsts;
     int      log_level;
     uint32_t vram_size;
     uint32_t vram_mask;
@@ -278,6 +291,7 @@ typedef struct athena_t {
 } athena_t;
 
 static video_timings_t timing_athena_isa = { .type = VIDEO_ISA, .write_b = 3, .write_w = 3, .write_l = 6, .read_b = 5, .read_w = 5, .read_l = 10 };
+static video_timings_t timing_athena_pci = { .type = VIDEO_PCI, .write_b = 4, .write_w = 4, .write_l = 4, .read_b = 10, .read_w = 10, .read_l = 10 };
 static video_timings_t timing_athena_vlb = { .type = VIDEO_BUS, .write_b = 4, .write_w = 4, .write_l = 4, .read_b = 10, .read_w = 10, .read_l = 10 };
 
 static const uint32_t mapsel_base[8] = { 0, 0xac000, 0xc8000, 0xcc000, 0xd0000, 0xd4000, 0xd8000, 0xdc000 };
@@ -338,7 +352,8 @@ athena_build_straps(athena_t *athena, int mapsel, int product, int pcbrev)
     uint32_t rambank;
 
     vd |= 0x19;                                /* VD<4:0>   internal */
-    vd |= (uint64_t) 1 << 5;                   /* VD<5>     vgaen0, 46E8 feature */
+    if (!athena->is_pci)
+        vd |= (uint64_t) 1 << 5;               /* VD<5>     vgaen0, 46E8 feature */
     vd |= (uint64_t) 0x027 << 6;               /* VD<15:6>  internal */
     vd |= (uint64_t) (pcbrev & 7) << 16;       /* VD<18:16> PCB revision */
     /* VD<19> block8/ = 0: 8-bit block mode VRAM. */
@@ -353,17 +368,20 @@ athena_build_straps(athena_t *athena, int mapsel, int product, int pcbrev)
         rambank |= (1 << 8);
     vd |= (uint64_t) (rambank & 0xff) << 25;   /* VD<32:25> */
     vd |= (uint64_t) ((rambank >> 8) & 1) << 35;
-    /* VD<34:33> ramspeed = 0, VD<36> HiRes/ = 0 (1600x1200 capable),
-       VD<37> vgaen1 = 0. */
+    /* VD<34:33> ramspeed = 0, VD<36> HiRes/ = 0 (1600x1200 capable). */
+    if (athena->is_pci)
+        vd |= (uint64_t) 1 << 37;              /* vgaen1: VGA on, no 46E8 (PCI) */
     vd |= (uint64_t) 1 << 38;                  /* testwren pull-up */
     vd |= (uint64_t) 1 << 39;                  /* reserved, high */
     vd |= (uint64_t) 0xdf << 40;               /* VD<47:40> internal */
     vd |= (uint64_t) 1 << 48;                  /* 200MHz strap high: regular DAC */
     /* VD<49>, VD<50> low: no DUBIC, no external multiplexers. */
     /* VD<52:51> hyperpg = 0, VD<53> expdev = 0, VD<54> tram = 0. */
-    vd |= (uint64_t) 1 << 55;                  /* isa */
-    vd |= (uint64_t) 1 << 56;                  /* pci (inverted) -> 0 */
-    vd |= (uint64_t) 1 << 57;                  /* above1meg (inverted) -> 0 */
+    if (!athena->is_pci) {
+        vd |= (uint64_t) 1 << 55;              /* isa */
+        vd |= (uint64_t) 1 << 56;              /* pci (inverted) -> 0 */
+        vd |= (uint64_t) 1 << 57;              /* above1meg (inverted) -> 0 */
+    }
     vd |= (uint64_t) 1 << 58;                  /* driverdy (inverted) -> 0 */
     vd |= (uint64_t) (mapsel & 7) << 59;       /* VD<61:59> mapsel */
     vd |= (uint64_t) 1 << 62;                  /* config<1:0> = 01, 16-bit */
@@ -380,7 +398,7 @@ athena_hard_reset(athena_t *athena)
     athena->config |= (uint32_t) ((vd >> 62) & 3);                 /* config<1:0> */
     athena->config |= (uint32_t) (!((vd >> 50) & 1)) << 4;          /* nodubic<0> */
     athena->config |= (uint32_t) (!((vd >> 58) & 1)) << 8;          /* driverdy */
-    if ((vd >> 5) & 1)
+    if (((vd >> 5) & 1) || ((vd >> 37) & 1))
         athena->config |= CFG_BIOSEN | CFG_VGAEN;
     athena->config |= (uint32_t) (!((vd >> 57) & 1)) << 12;         /* above1meg */
     athena->config |= (uint32_t) ((vd >> 59) & 7) << CFG_MAPSEL_SHIFT;
@@ -395,6 +413,7 @@ athena_hard_reset(athena_t *athena)
     athena->istat     = 0;
     athena->vrampage  = 0;
     athena->pos_46e8  = 0x08;
+    athena->intsts    = 0;
 
     memset(&athena->dw, 0, sizeof(athena->dw));
     athena->dw.mctlwtst  = 0xffffffff;
@@ -550,7 +569,7 @@ athena_out(uint16_t addr, uint8_t val, void *priv)
     athena_t *athena = (athena_t *) priv;
 
     athena_log(athena, LOG_ALL, "Athena: OUT %03X, %02X\n", addr, val);
-    if (!(athena->config & CFG_VGAEN))
+    if (!(athena->config & CFG_VGAEN) || (athena->is_pci && !(athena->pci_cmd & PCI_COMMAND_IO)))
         return;
 
     athena_vga_out(addr, val, athena);
@@ -563,7 +582,7 @@ athena_in(uint16_t addr, void *priv)
 
     uint8_t   ret;
 
-    if (!(athena->config & CFG_VGAEN))
+    if (!(athena->config & CFG_VGAEN) || (athena->is_pci && !(athena->pci_cmd & PCI_COMMAND_IO)))
         return 0xff;
 
     ret = athena_vga_in(addr, athena);
@@ -686,55 +705,212 @@ athena_recalctimings(svga_t *svga)
 /* ------------------------------------------------------------------ */
 
 static void
+athena_set_vga_mapping(athena_t *athena)
+{
+    svga_t *svga = &athena->svga;
+
+    switch (svga->gdcreg[6] & 0x0c) {
+        case 0x0: /*128k at A0000*/
+            mem_mapping_set_addr(&svga->mapping, 0xa0000, 0x20000);
+            svga->banked_mask = 0xffff;
+            break;
+        case 0x4: /*64k at A0000*/
+            mem_mapping_set_addr(&svga->mapping, 0xa0000, 0x10000);
+            svga->banked_mask = 0xffff;
+            break;
+        case 0x8: /*32k at B0000*/
+            mem_mapping_set_addr(&svga->mapping, 0xb0000, 0x08000);
+            svga->banked_mask = 0x7fff;
+            break;
+        case 0xC: /*32k at B8000*/
+            mem_mapping_set_addr(&svga->mapping, 0xb8000, 0x08000);
+            svga->banked_mask = 0x7fff;
+            break;
+        default:
+            break;
+    }
+}
+
+static void
 athena_recalc_mapping(athena_t *athena)
 {
-    svga_t  *svga   = &athena->svga;
-    int      mapsel = (athena->config & CFG_MAPSEL_MASK) >> CFG_MAPSEL_SHIFT;
-    uint32_t base   = mapsel_base[mapsel];
-    int      enable = (base != 0);
+    svga_t  *svga = &athena->svga;
+    uint32_t base;
+    int      enable;
 
-    /* The AC000h map only decodes when the VGA does not use A0000h-AFFFFh. */
-    if (enable && (base == 0xac000) && (athena->config & CFG_VGAEN) && !(svga->gdcreg[6] & 0x08))
-        enable = 0;
+    if (athena->is_pci) {
+        int memspace = !!(athena->pci_cmd & PCI_COMMAND_MEM);
 
-    if ((athena->config & CFG_VGAEN) && (athena->pos_46e8 & 0x08)) {
-        switch (svga->gdcreg[6] & 0x0c) {
-            case 0x0: /*128k at A0000*/
-                mem_mapping_set_addr(&svga->mapping, 0xa0000, 0x20000);
-                svga->banked_mask = 0xffff;
-                break;
-            case 0x4: /*64k at A0000*/
-                mem_mapping_set_addr(&svga->mapping, 0xa0000, 0x10000);
-                svga->banked_mask = 0xffff;
-                break;
-            case 0x8: /*32k at B0000*/
-                mem_mapping_set_addr(&svga->mapping, 0xb0000, 0x08000);
-                svga->banked_mask = 0x7fff;
-                break;
-            case 0xC: /*32k at B8000*/
-                mem_mapping_set_addr(&svga->mapping, 0xb8000, 0x08000);
-                svga->banked_mask = 0x7fff;
-                break;
-            default:
-                break;
-        }
-    } else
-        mem_mapping_disable(&svga->mapping);
+        if (memspace && (athena->config & CFG_VGAEN))
+            athena_set_vga_mapping(athena);
+        else
+            mem_mapping_disable(&svga->mapping);
 
-    if (athena->config & CFG_BIOSEN)
-        mem_mapping_enable(&athena->bios_rom.mapping);
-    else
-        mem_mapping_disable(&athena->bios_rom.mapping);
+        if (memspace && (athena->config & CFG_BIOSEN) && (athena->rombase & 1))
+            mem_mapping_set_addr(&athena->bios_rom.mapping, athena->rombase & 0xffff8000, 0x8000);
+        else
+            mem_mapping_disable(&athena->bios_rom.mapping);
+
+        base   = athena->termbase & 0xffffc000;
+        enable = memspace && base;
+    } else {
+        int mapsel = (athena->config & CFG_MAPSEL_MASK) >> CFG_MAPSEL_SHIFT;
+
+        base   = mapsel_base[mapsel];
+        enable = (base != 0);
+
+        /* The AC000h map only decodes when the VGA does not use A0000h-AFFFFh. */
+        if (enable && (base == 0xac000) && (athena->config & CFG_VGAEN) && !(svga->gdcreg[6] & 0x08))
+            enable = 0;
+
+        if ((athena->config & CFG_VGAEN) && (athena->pos_46e8 & 0x08))
+            athena_set_vga_mapping(athena);
+        else
+            mem_mapping_disable(&svga->mapping);
+
+        if (athena->config & CFG_BIOSEN)
+            mem_mapping_enable(&athena->bios_rom.mapping);
+        else
+            mem_mapping_disable(&athena->bios_rom.mapping);
+    }
 
     if (enable) {
         if (!athena->win_enabled || (athena->win_base != base))
-            athena_log(athena, LOG_SUMMARY, "Athena: Power Graphic window at %05X\n", base);
+            athena_log(athena, LOG_SUMMARY, "Athena: Power Graphic window at %08X\n", base);
         mem_mapping_set_addr(&athena->win_mapping, base, 0x4000);
     } else
         mem_mapping_disable(&athena->win_mapping);
 
     athena->win_base    = base;
     athena->win_enabled = enable;
+}
+
+/* ------------------------------------------------------------------ */
+/* PCI configuration space                                             */
+/* ------------------------------------------------------------------ */
+
+static uint8_t
+athena_pci_read(UNUSED(int func), int addr, UNUSED(int len), void *priv)
+{
+    const athena_t *athena = (athena_t *) priv;
+    uint8_t         ret    = 0x00;
+
+    switch (addr) {
+        case 0x00:
+            ret = 0x2b; /* Matrox */
+            break;
+        case 0x01:
+            ret = 0x10;
+            break;
+        case 0x02:
+            ret = 0x10; /* 0D10h: "ATH" in 5-bit ASCII */
+            break;
+        case 0x03:
+            ret = 0x0d;
+            break;
+        case 0x04:
+            ret = (athena->pci_cmd & 0x23) | 0x80; /* waitcycle reads 1 */
+            break;
+        case 0x07:
+            ret = 0x02; /* devseltim = 01 (medium) */
+            break;
+        case 0x08:
+            ret = 0x00; /* revision */
+            break;
+        case 0x0a:
+            ret = (athena->config & CFG_VGAEN) ? 0x00 : 0x80;
+            break;
+        case 0x0b:
+            ret = 0x03;
+            break;
+        case 0x10:
+            ret = 0x00; /* memory BAR, 32-bit, not prefetchable */
+            break;
+        case 0x11:
+            ret = (athena->termbase >> 8) & 0xc0;
+            break;
+        case 0x12:
+            ret = (athena->termbase >> 16) & 0xff;
+            break;
+        case 0x13:
+            ret = (athena->termbase >> 24) & 0xff;
+            break;
+        case 0x30:
+            ret = (athena->config & CFG_BIOSEN) ? (athena->rombase & 0x01) : 0x00;
+            break;
+        case 0x31:
+            ret = (athena->rombase >> 8) & 0x80;
+            break;
+        case 0x32:
+            ret = (athena->rombase >> 16) & 0xff;
+            break;
+        case 0x33:
+            ret = (athena->rombase >> 24) & 0xff;
+            break;
+        case 0x3c:
+            ret = athena->int_line;
+            break;
+        case 0x3d:
+            ret = PCI_INTA;
+            break;
+        case 0x40:
+            ret = athena->pci_option & 3;
+            break;
+        default:
+            break;
+    }
+
+    return ret;
+}
+
+static void
+athena_pci_write(UNUSED(int func), int addr, UNUSED(int len), uint8_t val, void *priv)
+{
+    athena_t *athena = (athena_t *) priv;
+
+    switch (addr) {
+        case 0x04:
+            athena->pci_cmd = val & 0x23;
+            athena_recalc_mapping(athena);
+            break;
+        case 0x11:
+            athena->termbase = (athena->termbase & 0xffff0000) | ((val & 0xc0) << 8);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x12:
+            athena->termbase = (athena->termbase & 0xff00c000) | (val << 16);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x13:
+            athena->termbase = (athena->termbase & 0x00ffc000) | (val << 24);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x30:
+            if (athena->config & CFG_BIOSEN)
+                athena->rombase = (athena->rombase & 0xffff8000) | (val & 0x01);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x31:
+            athena->rombase = (athena->rombase & 0xffff0001) | ((val & 0x80) << 8);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x32:
+            athena->rombase = (athena->rombase & 0xff008001) | (val << 16);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x33:
+            athena->rombase = (athena->rombase & 0x00ff8001) | (val << 24);
+            athena_recalc_mapping(athena);
+            break;
+        case 0x3c:
+            athena->int_line = val;
+            break;
+        case 0x40:
+            athena->pci_option = val & 3;
+            break;
+        default:
+            break;
+    }
 }
 
 static inline int32_t
@@ -1860,6 +2036,14 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
         case REG_BYTACCDATA:
             val = athena->acc_val;
             break;
+        case REG_INTSTS:
+            if (athena->is_pci) {
+                /* tirqsts<0> is active low: no interrupt from the chip. */
+                val = (athena->intsts & 0x102) | 1;
+                break;
+            }
+            athena_log(athena, LOG_SUMMARY, "Athena: read of PCI-only INTSTS on a non-PCI board\n");
+            break;
         case REG_ADRGEN:
             val = athena->adrgen_word;
             break;
@@ -1888,6 +2072,12 @@ athena_host_write_b(athena_t *athena, uint32_t addr, uint8_t val)
             break;
         case REG_ICLEAR:
             athena->istat &= ~(v & 7);
+            break;
+        case REG_INTSTS:
+            if (athena->is_pci) {
+                athena->intsts &= ~(v & 2);
+                athena->intsts = (athena->intsts & ~(mask & 0x100)) | (v & 0x100);
+            }
             break;
         case REG_IEN:
             athena->ien = ((athena->ien & ~mask) | v) & 0xf;
@@ -2176,11 +2366,12 @@ athena_init(const device_t *info)
     int       product;
 
     athena->is_vlb    = !!(info->flags & DEVICE_VLB);
+    athena->is_pci    = !!(info->flags & DEVICE_PCI);
     athena->vram_size = device_get_config_int("memory") << 20;
     athena->vram_mask = athena->vram_size - 1;
     athena->log_level = device_get_config_int("diag_log");
 
-    switch (device_get_config_hex20("base")) {
+    switch (athena->is_pci ? 0 : device_get_config_hex20("base")) {
         case 0xc8000:
             mapsel = 2;
             break;
@@ -2204,15 +2395,22 @@ athena_init(const device_t *info)
             break;
     }
 
-    /* Product ID nibble: 11xx ISA, 101x VL-Bus. */
-    product = athena->is_vlb ? 0xa : 0xc;
-    product |= device_get_config_int("product_low") & (athena->is_vlb ? 1 : 3);
+    /* Product ID nibble: 11xx ISA, 101x VL-Bus, 0110 PCI. */
+    if (athena->is_pci) {
+        product = 0x6;
+        mapsel  = 0;
+    } else {
+        product = athena->is_vlb ? 0xa : 0xc;
+        product |= device_get_config_int("product_low") & (athena->is_vlb ? 1 : 3);
+    }
 
     athena->straps = athena_build_straps(athena, mapsel, product, device_get_config_int("pcb_rev"));
 
     rom_init(&athena->bios_rom, ROM_IMPRESSION_PLUS, 0xc0000, 0x8000, 0x7fff, 0, MEM_MAPPING_EXTERNAL);
+    if (athena->is_pci)
+        mem_mapping_disable(&athena->bios_rom.mapping); /* placed by ROMBASE */
 
-    video_inform(VIDEO_FLAG_TYPE_SPECIAL, athena->is_vlb ? &timing_athena_vlb : &timing_athena_isa);
+    video_inform(VIDEO_FLAG_TYPE_SPECIAL, athena->is_pci ? &timing_athena_pci : (athena->is_vlb ? &timing_athena_vlb : &timing_athena_isa));
 
     svga_init(info, &athena->svga, athena, athena->vram_size,
               athena_recalctimings, athena_in, athena_out, NULL, NULL);
@@ -2227,7 +2425,8 @@ athena_init(const device_t *info)
     athena->svga.vram_display_mask = athena->vram_mask;
 
     io_sethandler(0x03a0, 0x0040, athena_in, NULL, NULL, athena_out, NULL, NULL, athena);
-    io_sethandler(0x46e8, 0x0001, athena_46e8_in, NULL, NULL, athena_46e8_out, NULL, NULL, athena);
+    if (!athena->is_pci)
+        io_sethandler(0x46e8, 0x0001, athena_46e8_in, NULL, NULL, athena_46e8_out, NULL, NULL, athena);
 
     mem_mapping_add(&athena->win_mapping, 0, 0,
                     athena_win_readb, athena_win_readw, athena_win_readl,
@@ -2247,10 +2446,16 @@ athena_init(const device_t *info)
 
     athena->acc_addr = 0xffffffff;
     athena_hard_reset(athena);
+
+    if (athena->is_pci) {
+        athena->int_line = 0xff;
+        pci_add_card(PCI_ADD_NORMAL, athena_pci_read, athena_pci_write, athena, &athena->pci_slot);
+    }
+
     athena_recalc_mapping(athena);
 
-    athena_log(athena, LOG_SUMMARY, "Athena: %s, %d MB, window %05X, VD straps %08X%08X\n",
-               info->name, athena->vram_size >> 20, mapsel_base[mapsel],
+    athena_log(athena, LOG_SUMMARY, "Athena: %s, %d MB, window %s%05X, VD straps %08X%08X\n",
+               info->name, athena->vram_size >> 20, athena->is_pci ? "PCI BAR / " : "", mapsel_base[mapsel],
                (uint32_t) (athena->straps >> 32), (uint32_t) athena->straps);
 
     return athena;
@@ -2368,6 +2573,55 @@ static const device_config_t athena_config[] = {
   // clang-format on
 };
 
+static const device_config_t athena_pci_config[] = {
+  // clang-format off
+    {
+        .name           = "memory",
+        .description    = "Memory size",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 2,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "2 MB", .value = 2 },
+            { .description = "4 MB", .value = 4 },
+            { .description = ""                 }
+        },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "pcb_rev",
+        .description    = "PCB revision strap",
+        .type           = CONFIG_SPINNER,
+        .default_string = NULL,
+        .default_int    = 2,
+        .file_filter    = NULL,
+        .spinner        = { .min = 0, .max = 7, .step = 1 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "diag_log",
+        .description    = "Diagnostic log",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = LOG_OFF,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "Off",                  .value = LOG_OFF     },
+            { .description = "Summary",              .value = LOG_SUMMARY },
+            { .description = "Registers",            .value = LOG_REGS    },
+            { .description = "Everything (slow)",    .value = LOG_ALL     },
+            { .description = ""                                           }
+        },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+  // clang-format on
+};
+
 const device_t mga_impression_plus_isa_device = {
     .name          = "Matrox MGA Impression Plus (ISA)",
     .internal_name = "mga_impression_plus_isa",
@@ -2394,4 +2648,18 @@ const device_t mga_impression_plus_vlb_device = {
     .speed_changed = athena_speed_changed,
     .force_redraw  = athena_force_redraw,
     .config        = athena_config
+};
+
+const device_t mga_impression_plus_pci_device = {
+    .name          = "Matrox MGA Impression Plus (PCI)",
+    .internal_name = "mga_impression_plus_pci",
+    .flags         = DEVICE_PCI,
+    .local         = 0,
+    .init          = athena_init,
+    .close         = athena_close,
+    .reset         = NULL,
+    .available     = athena_available,
+    .speed_changed = athena_speed_changed,
+    .force_redraw  = athena_force_redraw,
+    .config        = athena_pci_config
 };

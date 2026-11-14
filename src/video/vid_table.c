@@ -194,6 +194,7 @@ video_cards[] = {
     { .device = &gd5440_pci_device,                             .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &gd5446_pci_device,                             .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &gd5480_pci_device,                             .flags = VIDEO_FLAG_TYPE_NONE      },
+    { .device = &mga_impression_plus_pci_device,                .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &millennium_device,                             .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &millennium_ii_device,                          .flags = VIDEO_FLAG_TYPE_SEC       },
     { .device = &mystique_device,                               .flags = VIDEO_FLAG_TYPE_SEC       },

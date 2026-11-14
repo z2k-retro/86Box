@@ -542,6 +542,7 @@ extern const device_t pgc_device;
 extern const device_t millennium_device;
 extern const device_t mga_impression_plus_isa_device;
 extern const device_t mga_impression_plus_vlb_device;
+extern const device_t mga_impression_plus_pci_device;
 extern const device_t mystique_device;
 extern const device_t mystique_220_device;
 extern const device_t millennium_ii_device;
