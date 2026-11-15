@@ -77,7 +77,8 @@
 #include <86box/vid_svga.h>
 #include <86box/vid_svga_render.h>
 
-#define ROM_IMPRESSION_PLUS "roms/video/matrox/mga_impression_plus_v36p.bin"
+#define ROM_IMPRESSION_PLUS     "roms/video/matrox/mga_impression_plus_v36p.bin"
+#define ROM_IMPRESSION_PLUS_V40 "roms/video/matrox/mga_impression_plus_pci_v40.bin"
 
 /* Power Graphic mode window offsets. */
 #define REG_DWGCTL     0x1c00
@@ -351,40 +352,51 @@ athena_build_straps(athena_t *athena, int mapsel, int product, int pcbrev)
     uint64_t vd = 0;
     uint32_t rambank;
 
+    /* Board straps as read from a real IS-ATHENA R2 PCI board (TVP3026,
+       2 MB, no memory expansion): DST0 046D09D9, DST1 1246DFE2. The bus
+       dependent bits (55-57, 58, 61:59, 63:62) follow the ATHENA
+       specification for the ISA/VLB boards. */
     vd |= 0x19;                                /* VD<4:0>   internal */
     if (!athena->is_pci)
         vd |= (uint64_t) 1 << 5;               /* VD<5>     vgaen0, 46E8 feature */
     vd |= (uint64_t) 0x027 << 6;               /* VD<15:6>  internal */
-    vd |= (uint64_t) (pcbrev & 7) << 16;       /* VD<18:16> PCB revision */
-    /* VD<19> block8/ = 0: 8-bit block mode VRAM. */
+    vd |= (uint64_t) ((7 - pcbrev) & 7) << 16; /* VD<18:16> PCB revision, inverted (R2 reads 5) */
+    vd |= (uint64_t) 1 << 19;                  /* VD<19>    block8/ */
     vd |= (uint64_t) (product & 0xf) << 20;    /* VD<23:20> product / platform */
     /* VD<24> vgabank0 = 0. */
 
-    /* rambank<8:0>. The Matrox SXCI library only accepts two memory
-       codes on a No DUBIC board: bank 1 alone (2 MB) or banks 1 + 8
-       (4 MB). Bank 5 is tested on its own and flags the depth buffer. */
-    rambank = (1 << 1) | (1 << 5);
+    /* rambank<8:0>: bank 1 is the 2 MB on the board. The Matrox SXCI
+       library accepts bank 1 alone (2 MB) or banks 1 + 8 (4 MB). */
+    rambank = 1 << 1;
     if (athena->vram_size > (2 << 20))
         rambank |= (1 << 8);
     vd |= (uint64_t) (rambank & 0xff) << 25;   /* VD<32:25> */
+    vd |= (uint64_t) 1 << 33;                  /* VD<34:33> ramspeed = 01 */
     vd |= (uint64_t) ((rambank >> 8) & 1) << 35;
-    /* VD<34:33> ramspeed = 0, VD<36> HiRes/ = 0 (1600x1200 capable). */
+    /* VD<36> HiRes/ = 0 (1600x1200 capable). */
     if (athena->is_pci)
         vd |= (uint64_t) 1 << 37;              /* vgaen1: VGA on, no 46E8 (PCI) */
     vd |= (uint64_t) 1 << 38;                  /* testwren pull-up */
     vd |= (uint64_t) 1 << 39;                  /* reserved, high */
     vd |= (uint64_t) 0xdf << 40;               /* VD<47:40> internal */
-    vd |= (uint64_t) 1 << 48;                  /* 200MHz strap high: regular DAC */
-    /* VD<49>, VD<50> low: no DUBIC, no external multiplexers. */
-    /* VD<52:51> hyperpg = 0, VD<53> expdev = 0, VD<54> tram = 0. */
-    if (!athena->is_pci) {
+    /* VD<48> 200MHz = 0. */
+    vd |= (uint64_t) 1 << 49;                  /* nodubic<1> */
+    vd |= (uint64_t) 1 << 50;                  /* nodubic<0> (inverted) */
+    /* VD<52:51> hyperpg = 0, VD<53> expdev = 0. */
+    vd |= (uint64_t) 1 << 54;                  /* tram */
+    if (athena->is_pci) {
+        vd |= (uint64_t) 1 << 57;              /* above1meg (inverted) -> 0 */
+        /* VD<58> = 0: driverdy 1, VD<61:59> mapsel 010, VD<63:62> config 00,
+           as the specification requires of a PCI board. */
+        vd |= (uint64_t) 2 << 59;
+    } else {
         vd |= (uint64_t) 1 << 55;              /* isa */
         vd |= (uint64_t) 1 << 56;              /* pci (inverted) -> 0 */
         vd |= (uint64_t) 1 << 57;              /* above1meg (inverted) -> 0 */
+        vd |= (uint64_t) 1 << 58;              /* driverdy (inverted) -> 0 */
+        vd |= (uint64_t) (mapsel & 7) << 59;   /* VD<61:59> mapsel */
+        vd |= (uint64_t) 1 << 62;              /* config<1:0> = 01, 16-bit */
     }
-    vd |= (uint64_t) 1 << 58;                  /* driverdy (inverted) -> 0 */
-    vd |= (uint64_t) (mapsel & 7) << 59;       /* VD<61:59> mapsel */
-    vd |= (uint64_t) 1 << 62;                  /* config<1:0> = 01, 16-bit */
 
     return vd;
 }
@@ -539,15 +551,16 @@ athena_vga_in(uint16_t addr, athena_t *athena)
             switch (athena->aux_idx) {
                 case 0x05:
                 case 0x06:
-                case 0x07:
                     ret = 0x00;
                     break;
-                case 0x08:
-                    /* Revision code 2:0, memory config 00, display type 111. */
-                    ret = 0x27;
+                case 0x07:
+                    /* Monitor sense 11 on the real board (the spec says 00). */
+                    ret = 0xc0;
                     break;
-                case 0x0a:
-                    ret = athena->aux[0x0a] | 0x20;
+                case 0x08:
+                    /* Revision code 101, memory config 00, display type 111,
+                       as read from a real IS-ATHENA R2. */
+                    ret = 0xa7;
                     break;
                 default:
                     ret = athena->aux[athena->aux_idx];
@@ -1900,8 +1913,6 @@ athena_dwg_write(athena_t *athena, uint32_t addr, uint32_t val)
 static uint32_t
 athena_dwg_read(athena_t *athena, uint32_t reg)
 {
-    const athena_dwg_t *dw = &athena->dw;
-
     reg &= 0x1ffc & ~REG_GO;
 
     switch (reg) {
@@ -1909,32 +1920,9 @@ athena_dwg_read(athena_t *athena, uint32_t reg)
             return (uint32_t) athena->straps;
         case REG_DST1:
             return (uint32_t) (athena->straps >> 32);
-        case REG_DWGCTL:
-            return dw->dwgctl;
-        case REG_MACCESS:
-            return dw->maccess;
-        case REG_SRC0:
-        case REG_SRC1:
-        case REG_SRC2:
-        case REG_SRC3:
-            return dw->src[(reg - REG_SRC0) >> 2];
-        case REG_FXLEFT:
-            return (uint16_t) dw->fxleft;
-        case REG_FXRIGHT:
-            return (uint16_t) dw->fxright;
-        case REG_XDST:
-            return (uint16_t) dw->xdst;
-        case REG_YDST:
-            return dw->ydst;
-        case REG_LEN:
-            return dw->len;
         default:
-            if ((reg >= REG_AR0) && (reg <= REG_AR6))
-                return (uint32_t) dw->ar[(reg - REG_AR0) >> 2];
-            if ((reg >= REG_DR0) && (reg <= (REG_DR0 + 0x3c)))
-                return (uint32_t) dw->dr[(reg - REG_DR0) >> 2];
             athena_log(athena, LOG_REGS, "Athena: read of drawing register %04X\n", reg);
-            return 0;
+            return (reg & 4) ? (uint32_t) (athena->straps >> 32) : (uint32_t) athena->straps;
     }
 }
 
@@ -1999,8 +1987,9 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
             val = athena->vrampage & 0xffffe0;
             break;
         case REG_FIFOSTATUS:
-            /* 32 free locations, bus FIFO empty. */
-            val = 0x00000220;
+            /* addrgenstate 21h when idle (real board), 32 free locations,
+               bus FIFO empty. */
+            val = 0x21000220;
             break;
         case REG_STATUS:
             val = athena->istat & 7;
@@ -2031,15 +2020,16 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
             val = athena->crtc_ctrl;
             break;
         case REG_VCOUNT:
-            val = athena->svga.vc;
+            /* Reads 0 while the VGA is on (real board). */
+            val = (athena->config & CFG_VGAEN) ? 0 : athena->svga.vc;
             break;
         case REG_BYTACCDATA:
             val = athena->acc_val;
             break;
         case REG_INTSTS:
             if (athena->is_pci) {
-                /* tirqsts<0> is active low: no interrupt from the chip. */
-                val = (athena->intsts & 0x102) | 1;
+                /* tirqsts<0> reads 0 on the real board with no interrupt pending. */
+                val = athena->intsts & 0x102;
                 break;
             }
             athena_log(athena, LOG_SUMMARY, "Athena: read of PCI-only INTSTS on a non-PCI board\n");
@@ -2406,7 +2396,9 @@ athena_init(const device_t *info)
 
     athena->straps = athena_build_straps(athena, mapsel, product, device_get_config_int("pcb_rev"));
 
-    rom_init(&athena->bios_rom, ROM_IMPRESSION_PLUS, 0xc0000, 0x8000, 0x7fff, 0, MEM_MAPPING_EXTERNAL);
+    rom_init(&athena->bios_rom,
+             (athena->is_pci && device_get_config_int("bios_v40")) ? ROM_IMPRESSION_PLUS_V40 : ROM_IMPRESSION_PLUS,
+             0xc0000, 0x8000, 0x7fff, 0, MEM_MAPPING_EXTERNAL);
     if (athena->is_pci)
         mem_mapping_disable(&athena->bios_rom.mapping); /* placed by ROMBASE */
 
@@ -2532,7 +2524,7 @@ static const device_config_t athena_config[] = {
     },
     {
         .name           = "pcb_rev",
-        .description    = "PCB revision strap",
+        .description    = "PCB revision",
         .type           = CONFIG_SPINNER,
         .default_string = NULL,
         .default_int    = 2,
@@ -2591,8 +2583,23 @@ static const device_config_t athena_pci_config[] = {
         .bios           = { { 0 } }
     },
     {
+        .name           = "bios_v40",
+        .description    = "Video BIOS",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "V4.0 (IS-ATHENA R2 PCI)", .value = 1 },
+            { .description = "V3.6p",                   .value = 0 },
+            { .description = ""                                    }
+        },
+        .bios           = { { 0 } }
+    },
+    {
         .name           = "pcb_rev",
-        .description    = "PCB revision strap",
+        .description    = "PCB revision",
         .type           = CONFIG_SPINNER,
         .default_string = NULL,
         .default_int    = 2,
