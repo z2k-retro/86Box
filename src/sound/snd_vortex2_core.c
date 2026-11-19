@@ -1089,6 +1089,79 @@ gather(v2_chip_t *c, int sink)
     return o;
 }
 
+/* A mixer between a stream and a converter. For a DirectSound buffer with
+   3D control the driver downmixes a stereo stream to mono ahead of the
+   converter: DMA -> two inputs of a mixer -> mixer output -> converter ->
+   A3D input (dxdiag's hardware-buffer test: routes 02>62 02>63 3a>44,
+   mixer 10 taking inputs 18 and 19). That mixer has to run at the stream's
+   rate, one output per sample the converter takes, or the stream plays at
+   48 kHz (2.2 times too fast at 22 kHz). If a converter's only input is a
+   mixer whose enabled inputs are fed by playback channels alone, return
+   that mixer and one of its channels; otherwise -1. */
+static int
+src_pulled_mixer(v2_chip_t *c, int sink, v2_dma_t **dp)
+{
+    if (c->sink_n[sink] != 1)
+        return -1;
+    int a = c->route[c->sink_r[sink][0]].src;
+    if (a < AS_MIXOUT || a >= AS_MIXOUT + NR_MIXOUT)
+        return -1;
+    int       m = a - AS_MIXOUT, any = 0;
+    v2_dma_t *d = NULL;
+    for (int i = 0; i < NR_MIXIN; i++) {
+        if (!(R(MIX_ENIN + ((m << 3) + (i >> 2)) * 4) & (1u << (i & 3))))
+            continue;
+        for (int k = 0; k < c->sink_n[AK_MIXIN + i]; k++) {
+            v2_route_t *rt = &c->route[c->sink_r[AK_MIXIN + i][k]];
+            if (rt->src >= NR_ADBDMA)
+                return -1;
+            if (!d || d->state == DMA_IDLE)
+                d = &c->adb[rt->src];
+            any = 1;
+        }
+    }
+    if (!any)
+        return -1;
+    *dp = d;
+    return m;
+}
+
+/* One output sample of such a mixer, taking one frame from each of its
+   streams: the arithmetic of mix_run, with gain changes taken at once
+   (the zero-crossing rule is not followed on this path). */
+static float
+mix_pull(v2_chip_t *c, int m)
+{
+    float acc = 0.0f;
+
+    c->mix_ran[m] = 1;
+    for (int i = 0; i < NR_MIXIN; i++) {
+        if (!(R(MIX_ENIN + ((m << 3) + (i >> 2)) * 4) & (1u << (i & 3))))
+            continue;
+        uint32_t a_cur = MIX_INVOL_B + ((m << 5) + i) * 4;
+        uint8_t  tb    = R(MIX_INVOL_A + ((m << 5) + i) * 4) & 0xff;
+        if (!((c->ro[(a_cur >> 2) >> 3] >> ((a_cur >> 2) & 7)) & 1))
+            R(a_cur) = (R(a_cur) & ~0xffu) | tb;
+        float g  = mix_gain_tab[R(a_cur) & 0xff];
+        float in = 0.0f;
+        for (int k = 0; k < c->sink_n[AK_MIXIN + i]; k++) {
+            v2_route_t *rt = &c->route[c->sink_r[AK_MIXIN + i][k]];
+            in += dma_take(c, &c->adb[rt->src], rt->idx, c->dma_nroutes[rt->src], &rt->cnt);
+        }
+        acc += floorf(g * in * 32768.0f) * (1.0f / 32768.0f);
+    }
+    uint32_t a_cur = MIX_VOL_B + m * 4;
+    if (!((c->ro[(a_cur >> 2) >> 3] >> ((a_cur >> 2) & 7)) & 1))
+        R(a_cur) = (R(a_cur) & ~0xffu) | (R(MIX_VOL_A + m * 4) & 0xff);
+    uint8_t b = R(a_cur) & 0xff;
+    float   v = acc > 32.0f ? 32.0f : (acc < -32.0f ? -32.0f : acc);
+    v *= mix_shift_tab[b];
+    v = v > 2.0f ? 2.0f : (v < -2.0f ? -2.0f : v);
+    v *= mix_mant_tab[b];
+    v = floorf(v * 32768.0f) * (1.0f / 32768.0f);
+    return v > 32767.0f / 32768.0f ? 32767.0f / 32768.0f : (v < -1.0f ? -1.0f : v);
+}
+
 /* Sample-rate converter: CONVRATIO is the input rate over 48 kHz in Q14.
    Fed from a DMA channel it pulls input at that ratio; fed from a 48 kHz
    source (recording paths) it passes samples through and the capture
@@ -1107,12 +1180,15 @@ src_run(v2_chip_t *c, int s, float *out)
             break;
         }
     }
-    if (!dr) {
+    v2_dma_t *d  = NULL;
+    int       pm = -1;
+    if (dr)
+        d = &c->adb[dr->src];
+    else if ((pm = src_pulled_mixer(c, sink, &d)) < 0) {
         memcpy(out, gather(c, sink), sizeof(float) * B);
         return;
     }
 
-    v2_dma_t *d    = &c->adb[dr->src];
     double    step = (double) (R(SRC_CONVRATIO + s * 4) & 0x3ffff) / 16384.0;
     if (step > 8.0)
         step = 8.0;
@@ -1124,7 +1200,7 @@ src_run(v2_chip_t *c, int s, float *out)
        tail after silence). */
     uint32_t now = c->glide_frames + 1;
     if (st->last_run && st->last_run != now && st->last_run + B != now) {
-        if (st->nin < d->frame_no)
+        if (dr && st->nin < d->frame_no)
             st->nin = d->frame_no;
         memset(st->hist, 0, sizeof(st->hist));
         st->zrun = SRC_PAD;
@@ -1148,7 +1224,7 @@ src_run(v2_chip_t *c, int s, float *out)
         st->phase += step;
         while (st->phase >= 1.0) {
             st->phase -= 1.0;
-            float   v = dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin);
+            float   v = dr ? dma_take(c, d, dr->idx, c->dma_nroutes[dr->src], &st->nin) : mix_pull(c, pm);
             int32_t x = (int32_t) lrintf(clampf(v, -1.0f, 32767.0f / 32768.0f) * 32768.0f);
             st->hist[st->hpos] = st->hist[st->hpos + SRC_PAD] = x;
             st->hpos = (st->hpos + 1) % SRC_PAD;
@@ -2228,6 +2304,24 @@ v2_run_block(v2_chip_t *c, float *out)
     c->a3d_done = c->xt_done = c->eq_done = c->adc_done = 0;
     c->glide_frames += B;
     mix_ramp(c);
+
+    /* A mixer that runs at a stream's rate ahead of a converter (see
+       src_pulled_mixer) is run only by that converter: its inputs and the
+       converter's input are not gathered at 48 kHz, which would take the
+       stream's samples a second time. */
+    for (int s = 0; s < NR_SRC; s++) {
+        v2_dma_t *d;
+        int       m = src_pulled_mixer(c, AK_SRCIN + s, &d);
+        if (m < 0)
+            continue;
+        c->kstate[AK_SRCIN + s] = 1;
+        memset(c->kbuf[AK_SRCIN + s], 0, sizeof(float) * B);
+        for (int i = 0; i < NR_MIXIN; i++)
+            if (R(MIX_ENIN + ((m << 3) + (i >> 2)) * 4) & (1u << (i & 3))) {
+                c->kstate[AK_MIXIN + i] = 1;
+                memset(c->kbuf[AK_MIXIN + i], 0, sizeof(float) * B);
+            }
+    }
 
     const float *fl = gather(c, AK_CODEC + 0);
     const float *fr = gather(c, AK_CODEC + 1);

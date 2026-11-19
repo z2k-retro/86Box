@@ -776,13 +776,23 @@ vortex2_block(void *priv)
     float rl = dev->rear_mix ? (float) sl / 32768.0f : 0.0f;
     float rr = dev->rear_mix ? (float) sr / 32768.0f : 0.0f;
 
+    /* Mixing the rear pair in: each output saturates on its own (the chip's
+       output clips at digital full scale before the codec's volume; run
+       12), and the two pairs are then averaged by the rear volume. In four-
+       speaker mode the driver sends the same sound to front and rear, so a
+       plain sum would be twice full scale on loud sounds and clip (dxdiag's
+       test sounds peak at 0.6 on each pair). */
+    float nl = 1.0f / (1.0f + rl), nr = 1.0f / (1.0f + rr);
+
     for (int n = 0; n < V2_BLOCK; n++) {
-        float l = dev->out[n * 4 + 0] + dev->out[n * 4 + 2] * rl;
-        float r = dev->out[n * 4 + 1] + dev->out[n * 4 + 3] * rr;
-        /* The chip's output saturates at digital full scale before the
-           codec's volume (run 12: summed tones clip at full scale). */
-        l = (l > 1.0f) ? 1.0f : ((l < -1.0f) ? -1.0f : l);
-        r = (r > 1.0f) ? 1.0f : ((r < -1.0f) ? -1.0f : r);
+        float l = dev->out[n * 4 + 0], r = dev->out[n * 4 + 1];
+        float bl = dev->out[n * 4 + 2], br = dev->out[n * 4 + 3];
+        l  = (l > 1.0f) ? 1.0f : ((l < -1.0f) ? -1.0f : l);
+        r  = (r > 1.0f) ? 1.0f : ((r < -1.0f) ? -1.0f : r);
+        bl = (bl > 1.0f) ? 1.0f : ((bl < -1.0f) ? -1.0f : bl);
+        br = (br > 1.0f) ? 1.0f : ((br < -1.0f) ? -1.0f : br);
+        l  = (l + bl * rl) * nl;
+        r  = (r + br * rr) * nr;
         int   w = (dev->ring_rd + dev->ring_n) % (V2_BLOCK * 8);
         if (dev->ring_n >= V2_BLOCK * 8) { /* consumer stalled: drop the oldest */
             dev->ring_rd = (dev->ring_rd + 1) % (V2_BLOCK * 8);
