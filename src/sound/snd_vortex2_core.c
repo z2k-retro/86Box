@@ -645,15 +645,25 @@ dma_page_end(v2_chip_t *c, v2_dma_t *d)
     }
 }
 
+/* Start a stream. `cont`: the stream had reached a page without carry-on
+   and the driver restarts it on a new page while its FIFO still holds the
+   old page's last samples. Aureal's Sound Blaster emulation streams this
+   way, in 128-byte pages each started from the end interrupt of the one
+   before (Duke Nukem 3D in a Windows DOS box: 17,000 restarts a minute). The
+   FIFO plays on into the new page, as the samples it holds were fetched
+   for this stream; dropping them lost 56 of every 128 bytes and reset the
+   converter each time, which played the sound too fast and distorted. */
 static void
-dma_begin(v2_chip_t *c, v2_dma_t *d)
+dma_begin(v2_chip_t *c, v2_dma_t *d, int cont)
 {
     d->touched  = 1;
-    d->primed   = 0;
-    d->frd      = 0;
-    d->fn       = 0;
-    d->frame_no = 0;
-    d->rate_acc = 0;
+    if (!cont) {
+        d->primed   = 0;
+        d->frd      = 0;
+        d->fn       = 0;
+        d->frame_no = 0;
+        d->rate_acc = 0;
+    }
     d->page  = (R(dma_start(d)) >> ((15 - (d->ch & 15)) * 2)) & 3;
     d->pos   = R(dma_ctrl(d)) & 0xfff;
     d->state = DMA_RUN;
@@ -917,8 +927,11 @@ static void
 fifo_ctrl_write(v2_chip_t *c, v2_dma_t *d, uint32_t old, uint32_t val)
 {
     if ((val & FIFO_VALID) && !(old & FIFO_VALID)) {
-        dma_begin(c, d);
-        if (d->is_wt) {
+        int cont = !d->is_wt && d->state == DMA_END && !d->stopped && d->fn > 0;
+        dma_begin(c, d, cont);
+        if (cont)
+            ;
+        else if (d->is_wt) {
             v2_wtv_t *v = &c->wtv[d->ch];
             memset(v, 0, sizeof(*v));
             v->fbyte = -1;
