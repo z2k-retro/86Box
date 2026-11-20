@@ -652,13 +652,20 @@ dma_page_end(v2_chip_t *c, v2_dma_t *d)
    before (Duke Nukem 3D in a Windows DOS box: 17,000 restarts a minute). The
    FIFO plays on into the new page, as the samples it holds were fetched
    for this stream; dropping them lost 56 of every 128 bytes and reset the
-   converter each time, which played the sound too fast and distorted. */
+   converter each time, which played the sound too fast and distorted.
+   (Real card, DOS Sound Blaster test: at each page's interrupt the stream
+   is still draining, 10 to 26 samples into its FIFO, and it is restarted
+   before the FIFO empties.) */
 static void
 dma_begin(v2_chip_t *c, v2_dma_t *d, int cont)
 {
     d->touched  = 1;
+    /* Either way the card fills its FIFO from the new page before it
+       plays on (a continued stream whose FIFO had run low otherwise kept
+       it low, and the next page end left almost no time to restart:
+       Duke Nukem 3D's pages then alternated 6 and 3 ms, with dropouts). */
+    d->primed = 0;
     if (!cont) {
-        d->primed   = 0;
         d->frd      = 0;
         d->fn       = 0;
         d->frame_no = 0;

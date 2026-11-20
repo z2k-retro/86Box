@@ -249,6 +249,31 @@ trace_time(const vortex2_t *dev)
 #define V2_CTRL_FM_EN 0x4
 
 static uint8_t fm_read(uint16_t port, void *priv);
+static double  trace_time(const vortex2_t *dev);
+
+/* The MPU-401 ports go through the device so that the trace option can
+   record them (as "port" lines, which v2replay skips): MIDI problems are
+   otherwise invisible in a trace. */
+static uint8_t
+mpu_port_read(uint16_t port, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+    uint8_t    v   = mpu401_read(port, dev->mpu);
+
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  R 0x%05x port 0x%08x\n", trace_time(dev), port, v);
+    return v;
+}
+
+static void
+mpu_port_write(uint16_t port, uint8_t val, void *priv)
+{
+    vortex2_t *dev = (vortex2_t *) priv;
+
+    if (dev->tracef)
+        fprintf(dev->tracef, "%11.6f  W 0x%05x port 0x%08x\n", trace_time(dev), port, val);
+    mpu401_write(port, val, dev->mpu);
+}
 static void    fm_write(uint16_t port, uint8_t val, void *priv);
 
 static void
@@ -259,7 +284,11 @@ legacy_remap(vortex2_t *dev)
     uint16_t game = (ctl & 8) ? (0x200 + ((ctl >> 9) & 7)) : 0;
 
     if (dev->mpu && midi != dev->mpu_addr) {
-        mpu401_change_addr(dev->mpu, midi);
+        if (dev->mpu_addr)
+            io_removehandler(dev->mpu_addr, 2, mpu_port_read, NULL, NULL, mpu_port_write, NULL, NULL, dev);
+        if (midi)
+            io_sethandler(midi, 2, mpu_port_read, NULL, NULL, mpu_port_write, NULL, NULL, dev);
+        dev->mpu->addr = midi;
         dev->mpu_addr = midi;
         vortex2_log("Vortex2: MPU-401 at %03x\n", midi);
     }
