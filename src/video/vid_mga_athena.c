@@ -48,10 +48,21 @@
  *            - Power Graphic CRTC offset and start address count
  *              16-pixel units.
  *
+ *          Measured on real IS-ATHENA R2 PCI boards (553-03 Rev A and a
+ *          revision 2 board), cold and with the SuperPack running:
+ *            - board straps, CONFIG, FIFOSTATUS, INTSTS, the AUX inputs
+ *              and the V4.0 video BIOS;
+ *            - drawing registers read back the 64-bit destination latch;
+ *              VCOUNT reads 0; 1E80-1EFF mirrors 1E00-1E7F;
+ *            - with pseudo-DMA on, the redundant VRAM window reads 0;
+ *            - 16-bit dithering is a per-channel 4x4 table of 0-7 offsets
+ *              (engine test strips match the card pixel for pixel);
+ *              intensities 256-383 saturate, 384-511 read as 0; depth
+ *              saturates at FFFFh;
+ *            - the depth buffer sits at half memory, 16 bits a pixel.
+ *
  *          Register layout and semantics follow the Matrox "MGA ATHENA
  *          Specification", revision 1 (May 16, 1994, manual 1034-MS).
- *          Strap values are a best estimate for an Impression Plus and
- *          can be adjusted from the device configuration.
  *
  * Authors: Z2k Retro and contributors.
  *
@@ -223,6 +234,7 @@ typedef struct athena_dwg_t {
     int      selline;
     int      funcnt;
     int      dst_valid; /* DST0/1 read back as straps until the engine runs. */
+    uint64_t dst_latch; /* afterwards: the engine's last destination quadword */
 } athena_dwg_t;
 
 typedef struct athena_t {
@@ -318,7 +330,20 @@ static const uint8_t trans_masks[16][16] = {
   // clang-format on
 };
 
-static uint8_t dither5[256][2][2];
+/* 16-bit dithering, measured on a real ATHENA: each channel's 8-bit
+   intensity gets an offset of 0-7 that depends on (y & 3, x & 3), then
+   keeps its top five bits. Red uses 7 - Bayer/2; green is red upside down;
+   blue has its own arrangement. */
+static const uint8_t dither_r[4][4] = { { 7, 3, 6, 2 }, { 1, 5, 0, 4 }, { 6, 2, 7, 3 }, { 0, 4, 1, 5 } };
+static const uint8_t dither_g[4][4] = { { 0, 4, 1, 5 }, { 6, 2, 7, 3 }, { 1, 5, 0, 4 }, { 7, 3, 6, 2 } };
+static const uint8_t dither_b[4][4] = { { 2, 6, 3, 7 }, { 4, 0, 5, 1 }, { 3, 7, 2, 6 }, { 5, 1, 4, 0 } };
+
+static inline int
+dither5(int c, int off)
+{
+    c = (c + off) >> 3;
+    return (c > 31) ? 31 : c;
+}
 
 static void athena_recalc_mapping(athena_t *athena);
 static void athena_dwg_write(athena_t *athena, uint32_t addr, uint32_t val);
@@ -347,13 +372,15 @@ athena_log(athena_t *athena, int level, const char *fmt, ...)
 /* ------------------------------------------------------------------ */
 
 static uint64_t
-athena_build_straps(athena_t *athena, int mapsel, int product, int pcbrev)
+athena_build_straps(athena_t *athena, int mapsel, int product, int pcbrev, int variant)
 {
     uint64_t vd = 0;
     uint32_t rambank;
 
-    /* Board straps as read from a real IS-ATHENA R2 PCI board (TVP3026,
-       2 MB, no memory expansion): DST0 046D09D9, DST1 1246DFE2. The bus
+    /* Board straps as read from two real IS-ATHENA R2 PCI boards (TVP3026,
+       2 MB, no memory expansion): a 553-03 Rev A board reads DST0 046C09D9,
+       DST1 1204DFE2 (PCB revision strap 3); a revision 2 board reads
+       046D09D9 / 1246DFE2, which adds nodubic<1> and tram (variant 1). The bus
        dependent bits (55-57, 58, 61:59, 63:62) follow the ATHENA
        specification for the ISA/VLB boards. */
     vd |= 0x19;                                /* VD<4:0>   internal */
@@ -380,10 +407,12 @@ athena_build_straps(athena_t *athena, int mapsel, int product, int pcbrev)
     vd |= (uint64_t) 1 << 39;                  /* reserved, high */
     vd |= (uint64_t) 0xdf << 40;               /* VD<47:40> internal */
     /* VD<48> 200MHz = 0. */
-    vd |= (uint64_t) 1 << 49;                  /* nodubic<1> */
+    if (variant)
+        vd |= (uint64_t) 1 << 49;              /* nodubic<1> */
     vd |= (uint64_t) 1 << 50;                  /* nodubic<0> (inverted) */
     /* VD<52:51> hyperpg = 0, VD<53> expdev = 0. */
-    vd |= (uint64_t) 1 << 54;                  /* tram */
+    if (variant)
+        vd |= (uint64_t) 1 << 54;              /* tram */
     if (athena->is_pci) {
         vd |= (uint64_t) 1 << 57;              /* above1meg (inverted) -> 0 */
         /* VD<58> = 0: driverdy 1, VD<61:59> mapsel 010, VD<63:62> config 00,
@@ -987,6 +1016,8 @@ athena_wr_pix(athena_t *athena, uint32_t pix, uint32_t val)
             break;
     }
     svga->changedvram[addr >> 12] = changeframecount;
+    athena->istat |= 4;                       /* pickists: the engine wrote a pixel */
+    athena->dw.dst_latch = *(uint64_t *) &svga->vram[addr & ~7];
 }
 
 static inline uint32_t
@@ -1103,35 +1134,37 @@ athena_pattern_bit(const athena_t *athena, int x)
     return (dw->src[bit >> 5] >> (bit & 31)) & 1;
 }
 
+static inline int
+athena_clamp_intensity(int32_t v)
+{
+    switch ((v >> 22) & 3) {
+        case 2:
+            return 255;
+        case 3:
+            return 0;
+        default:
+            return (v >> 15) & 0xff;
+    }
+}
+
 static inline uint32_t
 athena_shade_color(athena_t *athena, int x)
 {
     const athena_dwg_t *dw = &athena->dw;
-    int                 r  = dw->dr[4] >> 15;
-    int                 g  = dw->dr[8] >> 15;
-    int                 b  = dw->dr[12] >> 15;
-
-    /* Negative intensities are an overflow and saturate. */
-    if (dw->dr[4] & 0x800000)
-        r = 0;
-    else if (r > 255)
-        r = 255;
-    if (dw->dr[8] & 0x800000)
-        g = 0;
-    else if (g > 255)
-        g = 255;
-    if (dw->dr[12] & 0x800000)
-        b = 0;
-    else if (b > 255)
-        b = 255;
+    /* Out of range (measured): with the top two bits of the 24-bit
+       intensity at 10 (256-383) it saturates at 255; at 11 (384-511, that
+       is negative) it reads 0. */
+    int                 r  = athena_clamp_intensity(dw->dr[4]);
+    int                 g  = athena_clamp_intensity(dw->dr[8]);
+    int                 b  = athena_clamp_intensity(dw->dr[12]);
 
     switch (athena_pwidth(athena)) {
         case 1:
             {
-                int dx = x & 1;
-                int dy = dw->selline & 1;
+                int dx = x & 3;
+                int dy = dw->selline & 3;
 
-                return dither5[b][dy][dx] | (dither5[g][dy][dx] << 5) | (dither5[r][dy][dx] << 10);
+                return dither5(b, dither_b[dy][dx]) | (dither5(g, dither_g[dy][dx]) << 5) | (dither5(r, dither_r[dy][dx]) << 10);
             }
         case 2:
             {
@@ -1359,7 +1392,8 @@ athena_draw_trap(athena_t *athena)
                     int      pass = 1;
 
                     uint32_t zi   = pix & athena->zmask;
-                    uint32_t zraw = (dw->dr[0] < 0) ? 0 : ((uint32_t) dw->dr[0] >> 15);
+                    /* 17.15; values past FFFFh saturate (measured). */
+                    uint32_t zraw = (uint32_t) dw->dr[0] >> 15;
                     uint16_t z    = (zraw > 0xffff) ? 0xffff : (uint16_t) zraw;
 
                     /* ZI always writes depth; ZDRWEN only adds the compare. */
@@ -1915,15 +1949,15 @@ athena_dwg_read(athena_t *athena, uint32_t reg)
 {
     reg &= 0x1ffc & ~REG_GO;
 
-    switch (reg) {
-        case REG_DST0:
-            return (uint32_t) athena->straps;
-        case REG_DST1:
-            return (uint32_t) (athena->straps >> 32);
-        default:
-            athena_log(athena, LOG_REGS, "Athena: read of drawing register %04X\n", reg);
-            return (reg & 4) ? (uint32_t) (athena->straps >> 32) : (uint32_t) athena->straps;
-    }
+    /* The drawing registers are write-only: a read of any of them returns
+       DST0 or DST1 (address bit 2), the 64-bit destination latch. Until the
+       engine has run it holds the board straps; on a real card it then
+       holds the last destination pixels (for example 7C1F7C1F). */
+    uint64_t latch = athena->dw.dst_valid ? athena->dw.dst_latch : athena->straps;
+
+    if ((reg != REG_DST0) && (reg != REG_DST1))
+        athena_log(athena, LOG_REGS, "Athena: read of drawing register %04X\n", reg);
+    return (reg & 4) ? (uint32_t) (latch >> 32) : (uint32_t) latch;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1978,7 +2012,7 @@ athena_pdma_write(athena_t *athena, uint32_t val)
 static uint8_t
 athena_host_read_b(athena_t *athena, uint32_t addr)
 {
-    uint32_t reg   = addr & 0x1ffc;
+    uint32_t reg   = 0x1e00 | (addr & 0x7c);   /* 1E80-1EFF mirrors 1E00-1E7F */
     int      shift = (addr & 3) * 8;
     uint32_t val   = 0;
 
@@ -2020,16 +2054,16 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
             val = athena->crtc_ctrl;
             break;
         case REG_VCOUNT:
-            /* Reads 0 while the VGA is on (real board). */
-            val = (athena->config & CFG_VGAEN) ? 0 : athena->svga.vc;
+            /* Reads 0 on a real board, in VGA and Power Graphic mode alike. */
+            val = 0;
             break;
         case REG_BYTACCDATA:
             val = athena->acc_val;
             break;
         case REG_INTSTS:
             if (athena->is_pci) {
-                /* tirqsts<0> reads 0 on the real board with no interrupt pending. */
-                val = athena->intsts & 0x102;
+                /* tirqsts<0> is active low: 1, no interrupt (real board). */
+                val = (athena->intsts & 0x102) | 1;
                 break;
             }
             athena_log(athena, LOG_SUMMARY, "Athena: read of PCI-only INTSTS on a non-PCI board\n");
@@ -2048,7 +2082,7 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
 static void
 athena_host_write_b(athena_t *athena, uint32_t addr, uint8_t val)
 {
-    uint32_t reg   = addr & 0x1ffc;
+    uint32_t reg   = 0x1e00 | (addr & 0x7c);
     int      shift = (addr & 3) * 8;
     uint32_t mask  = 0xffu << shift;
     uint32_t v     = (uint32_t) val << shift;
@@ -2088,8 +2122,9 @@ athena_host_write_b(athena_t *athena, uint32_t addr, uint8_t val)
             break;
         case REG_CONFIG:
             old = athena->config;
-            /* config<1:0>, 200MHz, misc, nodubic<1>, biosen, vgaen, levelirq, expdev are writable. */
-            athena->config = (athena->config & ~(mask & 0x00010e2f)) | (v & 0x00010e2f);
+            /* config<1:0>, 200MHz, misc, nodubic<1:0>, biosen, vgaen, levelirq, expdev are
+               writable (SXCI sets nodubic<0> on a real board, which reads 0A000310). */
+            athena->config = (athena->config & ~(mask & 0x00010e3f)) | (v & 0x00010e3f);
             if ((old ^ athena->config) & (CFG_VGAEN | CFG_BIOSEN)) {
                 athena_log(athena, LOG_SUMMARY, "Athena: CONFIG %08X (VGA %s)\n", athena->config,
                            (athena->config & CFG_VGAEN) ? "enabled" : "disabled");
@@ -2100,7 +2135,8 @@ athena_host_write_b(athena_t *athena, uint32_t addr, uint8_t val)
             break;
         case REG_OPMODE:
             old = athena->opmode;
-            athena->opmode = ((athena->opmode & ~mask) | v) & 0x0ff30b1f;
+            /* Bit 19 holds too: SXCI leaves 04A90011 on a real board. */
+            athena->opmode = ((athena->opmode & ~mask) | v) & 0x0ffb0b1f;
             if ((old ^ athena->opmode) & (OPM_PSEUDODMA | OPM_DMAMOD_MASK))
                 athena->adrgen_state = 0;
             if ((athena->opmode & OPM_DMAACT) && !(old & OPM_DMAACT))
@@ -2166,8 +2202,9 @@ athena_ext_read(athena_t *athena, uint32_t addr)
         return ret;
     }
 
-    /* Nothing is fitted there in No DUBIC mode: the data bus floats. */
-    ret = 0xff;
+    /* Nothing is fitted there in No DUBIC mode. On a real board the DUBIC
+       and VIWIC ranges (3C80-3D7F) float to FF and the rest reads 00. */
+    ret = (addr < 0x3d80) ? 0xff : 0x00;
     athena_log(athena, LOG_REGS, "Athena: read of unfitted device at %04X\n", addr);
     return ret;
 }
@@ -2214,8 +2251,13 @@ athena_win_readb_int(uint32_t addr, void *priv)
         return athena_host_read_b(athena, off);
     if (off < 0x2000)
         return athena_vga_in(0x300 | (off & 0xff), athena);
-    if (off < 0x3c00)
+    if (off < 0x3c00) {
+        /* The redundant window only shows VRAM with pseudo-DMA off; a real
+           card reads 0 there while a game leaves pseudo-DMA on. */
+        if (athena->opmode & OPM_PSEUDODMA)
+            return 0x00;
         return athena->svga.vram[athena_vramwin_addr(athena, off - 0x2000)];
+    }
     return athena_ext_read(athena, off);
 }
 
@@ -2319,6 +2361,8 @@ athena_win_write_common(athena_t *athena, uint32_t off, uint32_t val, int size)
         else if (o < 0x3c00) {
             uint32_t a = athena_vramwin_addr(athena, o - 0x2000);
 
+            if (athena->opmode & OPM_PSEUDODMA)
+                continue;
             svga->vram[a]              = b;
             svga->changedvram[a >> 12] = changeframecount;
         } else
@@ -2394,7 +2438,12 @@ athena_init(const device_t *info)
         product |= device_get_config_int("product_low") & (athena->is_vlb ? 1 : 3);
     }
 
-    athena->straps = athena_build_straps(athena, mapsel, product, device_get_config_int("pcb_rev"));
+    if (athena->is_pci) {
+        int board = device_get_config_int("board");
+
+        athena->straps = athena_build_straps(athena, mapsel, product, board & 7, board >> 4);
+    } else
+        athena->straps = athena_build_straps(athena, mapsel, product, device_get_config_int("pcb_rev"), 0);
 
     rom_init(&athena->bios_rom,
              (athena->is_pci && device_get_config_int("bios_v40")) ? ROM_IMPRESSION_PLUS_V40 : ROM_IMPRESSION_PLUS,
@@ -2428,13 +2477,6 @@ athena_init(const device_t *info)
     /* ZTAG: one tag bit per pixel address (the depth itself is in VRAM). */
     athena->zmask = (athena->vram_size >> 1) - 1;
     athena->ztag  = calloc((athena->zmask + 1) >> 3, 1);
-
-    for (int c = 0; c < 256; c++) {
-        dither5[c][0][0] = c >> 3;
-        dither5[c][1][1] = ((c + 2) >> 3) > 31 ? 31 : ((c + 2) >> 3);
-        dither5[c][1][0] = ((c + 4) >> 3) > 31 ? 31 : ((c + 4) >> 3);
-        dither5[c][0][1] = ((c + 6) >> 3) > 31 ? 31 : ((c + 6) >> 3);
-    }
 
     athena->acc_addr = 0xffffffff;
     athena_hard_reset(athena);
@@ -2598,14 +2640,18 @@ static const device_config_t athena_pci_config[] = {
         .bios           = { { 0 } }
     },
     {
-        .name           = "pcb_rev",
-        .description    = "PCB revision",
-        .type           = CONFIG_SPINNER,
+        .name           = "board",
+        .description    = "Board",
+        .type           = CONFIG_SELECTION,
         .default_string = NULL,
-        .default_int    = 2,
+        .default_int    = 3,
         .file_filter    = NULL,
-        .spinner        = { .min = 0, .max = 7, .step = 1 },
-        .selection      = { { 0 } },
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "553-03 Rev A (PCB strap 3)",     .value = 3        },
+            { .description = "Revision 2 board (PCB strap 2)", .value = 2 | 0x10 },
+            { .description = ""                                                  }
+        },
         .bios           = { { 0 } }
     },
     {
