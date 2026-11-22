@@ -269,6 +269,8 @@ typedef struct athena_t {
 
     uint8_t  aux_idx;
     uint8_t  aux[16];
+    uint8_t  dac_idx;   /* TVP3026 index register, as last written */
+    uint8_t  dac_last;  /* last byte read from the RAMDAC */
     uint8_t  pos_46e8;
 
     /* External device space (DUBIC / VIWIC / clock generator / expansion):
@@ -2174,6 +2176,8 @@ athena_ext_write(athena_t *athena, uint32_t addr, uint8_t val)
             return;
         port = (uint16_t[]) { 0x3c8, 0x3c9, 0x3c6, 0x3c7 }[reg & 3];
         athena_log(athena, LOG_ALL, "Athena: RAMDAC[%X] = %02X\n", reg, val);
+        if (reg == 0)
+            athena->dac_idx = val;
         tvp3026_ramdac_out(port, !!(reg & 4), !!(reg & 8), val, svga->ramdac, svga);
         return;
     }
@@ -2198,6 +2202,22 @@ athena_ext_read(athena_t *athena, uint32_t addr)
             return 0xff;
         port = (uint16_t[]) { 0x3c8, 0x3c9, 0x3c6, 0x3c7 }[reg & 3];
         ret  = tvp3026_ramdac_in(port, !!(reg & 4), !!(reg & 8), svga->ramdac, svga);
+        if (reg == 0x0a) {
+            /* Measured on a real TVP3026: the silicon revision reads 03,
+               and an index with no register behind it returns whatever
+               the previous RAMDAC read left on the bus. */
+            static const uint64_t echo = 0x400003ff88ff7fbdull; /* 00 02-05 07-0E 10-17 1B 1F-29 3E */
+
+            if (athena->dac_idx == 0x01)
+                ret = 0x03;
+            else if (athena->dac_idx == 0x2b)
+                ret |= 0x1f;            /* GPIO pins float high on the board */
+            else if (athena->dac_idx == 0x3a)
+                ret = 0x00;             /* sense test: no comparator trip */
+            else if ((athena->dac_idx < 0x40) && ((echo >> athena->dac_idx) & 1))
+                ret = athena->dac_last;
+        }
+        athena->dac_last = ret;
         athena_log(athena, LOG_ALL, "Athena: RAMDAC[%X] read %02X\n", reg, ret);
         return ret;
     }
