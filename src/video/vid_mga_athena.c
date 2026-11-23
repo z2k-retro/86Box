@@ -1677,9 +1677,9 @@ athena_iload_data(athena_t *athena, uint32_t val)
                     int            eol;
 
                     if (dw->dwgctl & DWG_HBGR)
-                        eol = athena_iload_pixel(athena, athena_rgb_to_pw(athena, p[2], p[1], p[0]), 0);
-                    else
                         eol = athena_iload_pixel(athena, athena_rgb_to_pw(athena, p[0], p[1], p[2]), 0);
+                    else
+                        eol = athena_iload_pixel(athena, athena_rgb_to_pw(athena, p[2], p[1], p[0]), 0);
                     athena->cprs_n -= 3;
                     memmove(athena->cprs_buf, athena->cprs_buf + 3, athena->cprs_n);
                     if (eol) {
@@ -1693,13 +1693,13 @@ athena_iload_data(athena_t *athena, uint32_t val)
                 int b;
 
                 if (dw->dwgctl & DWG_HBGR) {
-                    r = (val >> 16) & 0xff;
-                    g = (val >> 8) & 0xff;
-                    b = val & 0xff;
-                } else {
                     r = val & 0xff;
                     g = (val >> 8) & 0xff;
                     b = (val >> 16) & 0xff;
+                } else {
+                    r = (val >> 16) & 0xff;
+                    g = (val >> 8) & 0xff;
+                    b = val & 0xff;
                 }
                 athena_iload_pixel(athena, athena_rgb_to_pw(athena, r, g, b), 0);
             }
@@ -2303,6 +2303,24 @@ athena_vramwin_addr(const athena_t *athena, uint32_t off)
     return ((athena->vrampage & 0xffffe0) + (off & 0x1fff)) & athena->vram_mask;
 }
 
+/* CPU reads through the VRAM window. Past the fitted memory nothing drives
+   the VD bus but the strap resistors, so the read returns the straps and
+   leaves them in the same latch DST0/DST1 read back. The Windows driver
+   relies on this: it reads at F80000 before reading DST0/DST1, so it finds
+   the straps again even after the engine has run (Windows restart). */
+static uint32_t
+athena_vramwin_read32(athena_t *athena, uint32_t off)
+{
+    uint32_t a = (athena->vrampage & 0xffffe0) + (off & 0x1fff);
+
+    if (a > athena->vram_mask) {
+        athena->dw.dst_latch = athena->straps;
+        athena->dw.dst_valid = 1;
+        return (uint32_t) (athena->straps >> ((a & 4) * 8));
+    }
+    return *(uint32_t *) &athena->svga.vram[a & ~3];
+}
+
 static uint8_t athena_win_readb_int(uint32_t addr, void *priv);
 
 static uint8_t
@@ -2327,7 +2345,7 @@ athena_win_readb_int(uint32_t addr, void *priv)
                 athena->acc_val = athena_idump_data(athena);
             return (athena->acc_val >> ((off & 3) * 8)) & 0xff;
         }
-        return athena->svga.vram[athena_vramwin_addr(athena, off)];
+        return (athena_vramwin_read32(athena, off & ~3) >> ((off & 3) * 8)) & 0xff;
     }
     if (off < 0x1e00)
         return (athena_dwg_read(athena, off) >> ((off & 3) * 8)) & 0xff;
@@ -2340,7 +2358,7 @@ athena_win_readb_int(uint32_t addr, void *priv)
            card reads 0 there while a game leaves pseudo-DMA on. */
         if (athena->opmode & OPM_PSEUDODMA)
             return 0x00;
-        return athena->svga.vram[athena_vramwin_addr(athena, off - 0x2000)];
+        return (athena_vramwin_read32(athena, (off - 0x2000) & ~3) >> ((off & 3) * 8)) & 0xff;
     }
     return athena_ext_read(athena, off);
 }
@@ -2354,7 +2372,7 @@ athena_win_readl(uint32_t addr, void *priv)
     if (off < 0x1c00) {
         if (athena->opmode & OPM_PSEUDODMA)
             return athena_idump_data(athena);
-        return *(uint32_t *) &athena->svga.vram[athena_vramwin_addr(athena, off)];
+        return athena_vramwin_read32(athena, off);
     }
     if (off < 0x1e00) {
         uint32_t ret = athena_dwg_read(athena, off);
