@@ -295,6 +295,8 @@ typedef struct athena_t {
     int      busy_op;
     int      iload_x;
     int      iload_lines;
+    uint8_t  cprs_buf[8];               /* 24-bit packed ILOAD bytes pending */
+    int      cprs_n;
     uint32_t iload_src;
     uint32_t idump_src;
     int      idump_x;
@@ -1514,7 +1516,7 @@ athena_draw_bitblt(athena_t *athena)
                 switch (bltmod) {
                     case DWG_BMONO:
                         {
-                            uint32_t s   = (uint32_t) src & 0x7ffffff;
+                            uint32_t s   = (uint32_t) src & 0xffffff;
                             int      bit = (athena->svga.vram[(s >> 3) & athena->vram_mask] >> (s & 7)) & 1;
 
                             if (bit || !transc)
@@ -1570,6 +1572,7 @@ athena_iload_start(athena_t *athena)
     athena->iload_x     = dw->fxleft;
     athena->iload_lines = dw->len & 0xffff;
     athena->iload_src   = dw->ar[3];
+    athena->cprs_n      = 0;
     if (!athena->iload_lines)
         athena->busy = 0;
 
@@ -1663,13 +1666,32 @@ athena_iload_data(athena_t *athena, uint32_t val)
             break;
 
         case DWG_BUCOL:
-            {
+            if (dw->dwgctl & DWG_HCPRS) {
+                /* 24-bit packed: four pixels in three dwords. Each source
+                   line starts on a fresh dword; the tail of the last one is
+                   padding. */
+                for (int i = 0; i < 4; i++)
+                    athena->cprs_buf[athena->cprs_n++] = (val >> (i * 8)) & 0xff;
+                while (athena->cprs_n >= 3) {
+                    const uint8_t *p   = athena->cprs_buf;
+                    int            eol;
+
+                    if (dw->dwgctl & DWG_HBGR)
+                        eol = athena_iload_pixel(athena, athena_rgb_to_pw(athena, p[2], p[1], p[0]), 0);
+                    else
+                        eol = athena_iload_pixel(athena, athena_rgb_to_pw(athena, p[0], p[1], p[2]), 0);
+                    athena->cprs_n -= 3;
+                    memmove(athena->cprs_buf, athena->cprs_buf + 3, athena->cprs_n);
+                    if (eol) {
+                        athena->cprs_n = 0;
+                        break;
+                    }
+                }
+            } else {
                 int r;
                 int g;
                 int b;
 
-                if (dw->dwgctl & DWG_HCPRS)
-                    athena_log(athena, LOG_SUMMARY, "Athena: 24-bit compressed ILOAD treated as 32-bit\n");
                 if (dw->dwgctl & DWG_HBGR) {
                     r = (val >> 16) & 0xff;
                     g = (val >> 8) & 0xff;
@@ -2406,7 +2428,13 @@ athena_win_write_common(athena_t *athena, uint32_t off, uint32_t val, int size)
     if (off < 0x1e00) {
         if (athena_accumulate(athena, off, val, size)) {
             athena->adrgen_state = 0;
-            athena_dwg_write(athena, off & ~3, athena->acc_val);
+            /* While an ILOAD waits for host data, the chip takes writes to
+               the drawing registers (1C00-1CFF) as that data: MGA24.DRV
+               loads its 32x32 masks with pseudo-DMA off through 1C00-1C7C. */
+            if (athena->busy && (athena->busy_op == OPC_ILOAD) && (off < 0x1d00))
+                athena_iload_data(athena, athena->acc_val);
+            else
+                athena_dwg_write(athena, off & ~3, athena->acc_val);
             athena->acc_addr = 0xffffffff;
         }
         return;
