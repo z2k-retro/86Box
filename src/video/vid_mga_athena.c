@@ -299,6 +299,7 @@ typedef struct athena_t {
     uint32_t idump_src;
     int      idump_x;
     int      idump_lines;
+    int      idump_left; /* host dwords still to be read */
 
     uint8_t  *ztag;
     uint32_t  zmask;
@@ -1584,6 +1585,7 @@ athena_iload_pixel(athena_t *athena, uint32_t val, int mono)
     athena_dwg_t *dw  = &athena->dw;
     int           x   = athena->iload_x;
     int           eol = 0;
+    int           src_eol = 0;
 
     if (athena->iload_lines <= 0)
         return 1;
@@ -1593,10 +1595,11 @@ athena_iload_pixel(athena_t *athena, uint32_t val, int mono)
         dw->ar[3]         = sext24(dw->ar[3] + dw->ar[5]);
         athena->iload_src = dw->ar[3];
         eol               = 1;
+        src_eol           = 1;
     } else
         athena->iload_src++;
 
-    if (athena_clip(athena, x)) {
+    if ((x <= dw->fxright) && athena_clip(athena, x)) {
         uint32_t pix = dw->ydst_lin + x;
 
         if (mono) {
@@ -1606,7 +1609,11 @@ athena_iload_pixel(athena_t *athena, uint32_t val, int mono)
             athena_raster_pix(athena, pix, val);
     }
 
-    if (x >= dw->fxright) {
+    /* A source line (AR3 to AR0) ends the destination line: the Windows
+       drivers send source lines wider than the destination (a 17-pixel
+       bitmap in 20-pixel lines) and the surplus is dropped. A linear
+       ILOAD is one continuous run, wrapped at FXRIGHT instead. */
+    if ((dw->dwgctl & DWG_LINEAR) ? (x >= dw->fxright) : src_eol) {
         athena->iload_x = dw->fxleft;
         athena->iload_lines--;
         athena_next_line(athena, !(dw->sgn & 4));
@@ -1707,6 +1714,16 @@ athena_idump_start(athena_t *athena)
     athena->idump_lines = dw->len & 0xffff;
     if (!athena->idump_lines)
         athena->busy = 0;
+    {
+        /* Host dwords the dump will produce: each line ends a dword. */
+        int ppl = (int) (((uint32_t) dw->ar[0] - (uint32_t) dw->ar[3]) & 0x3ffff);
+        int ppd = (athena_pwidth(athena) == 2) ? 1 : ((athena_pwidth(athena) == 1) ? 2 : 4);
+
+        if (ppl & 0x20000)
+            ppl = 0x40000 - ppl;
+        ppl++;
+        athena->idump_left = athena->idump_lines * ((ppl + ppd - 1) / ppd);
+    }
 
     athena_log(athena, LOG_REGS, "Athena: IDUMP from %08X to %08X x %d lines\n", dw->ar[3], dw->ar[0], athena->idump_lines);
 }
@@ -1740,6 +1757,8 @@ athena_idump_data(athena_t *athena)
 
     if (!athena->busy || (athena->busy_op != OPC_IDUMP))
         return 0xffffffff;
+    if (athena->idump_left > 0)
+        athena->idump_left--;
 
     switch (athena_pwidth(athena)) {
         case 1:
@@ -2049,7 +2068,11 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
             val = athena->istat & 7;
             if (athena->svga.cgastat & 8)
                 val |= 8;
-            if (athena->busy)
+            /* During IDUMP the engine runs ahead of the host into the bus
+               FIFO, so it reports idle while the last dword is still to be
+               read: the Matrox Windows 3.1 driver reads all but one dword,
+               checks dwgengsts and repeats the line if it is still set. */
+            if (athena->busy && !((athena->busy_op == OPC_IDUMP) && (athena->idump_left <= 1)))
                 val |= (1 << 16);
             break;
         case REG_IEN:
