@@ -2020,6 +2020,10 @@ athena_host_read_b(athena_t *athena, uint32_t addr)
 
     switch (reg) {
         case REG_VRAMPAGE:
+        case REG_VRAMPAGE + 4:
+            /* 1E04 is a second address for VRAMPAGE: a real board reads the
+               same value at both, and the Windows drivers set the page for
+               their font cache through 1E04. */
             val = athena->vrampage & 0xffffe0;
             break;
         case REG_FIFOSTATUS:
@@ -2092,6 +2096,7 @@ athena_host_write_b(athena_t *athena, uint32_t addr, uint8_t val)
 
     switch (reg) {
         case REG_VRAMPAGE:
+        case REG_VRAMPAGE + 4:
             athena->vrampage = ((athena->vrampage & ~mask) | v) & 0xffffe0;
             if (shift == 24)
                 athena_log(athena, LOG_REGS, "Athena: VRAMPAGE %06X\n", athena->vrampage);
