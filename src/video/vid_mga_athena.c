@@ -1504,6 +1504,47 @@ athena_draw_bitblt(athena_t *athena)
 
     src = dw->ar[3];
 
+    if (dw->dwgctl & DWG_PATTERN) {
+        /* Colour pattern BITBLT, as the Windows drivers use for dithered
+           brushes: 8 pattern rows AR5 apart in an aligned block, each row
+           stored twice over (16 pixels) with AR0 at its end. The source
+           wraps back 8 pixels at AR0 and back to row 0 after 8 rows; the
+           destination width alone ends a line. */
+        int32_t blk = dw->ar[5] * 8;
+
+        for (int y = 0; y < lines; y++) {
+            const uint8_t *trans = &trans_masks[tsel][(dw->selline & 3) * 4];
+            int            x     = scanleft ? dw->fxright : dw->fxleft;
+            int            x_end = scanleft ? dw->fxleft : dw->fxright;
+            int32_t        delta;
+
+            src = dw->ar[3];
+            while (1) {
+                if (athena_clip(athena, x) && trans[x & 3])
+                    athena_raster_pix(athena, dw->ydst_lin + x, athena_rd_pix(athena, (uint32_t) src));
+                if (((uint32_t) src & 0x3ffff) == ((uint32_t) dw->ar[0] & 0x3ffff))
+                    src -= 7;
+                else
+                    src += x_dir;
+                if (x == x_end)
+                    break;
+                x += x_dir;
+            }
+
+            delta = dw->ar[5];
+            if (blk > 0) {
+                int32_t base = dw->ar[3] - (int32_t) ((uint32_t) dw->ar[3] % (uint32_t) blk);
+
+                delta = (base + (int32_t) (((uint32_t) (dw->ar[3] - base + dw->ar[5])) % (uint32_t) blk)) - dw->ar[3];
+            }
+            dw->ar[3] = sext24(dw->ar[3] + delta);
+            dw->ar[0] = sext18(dw->ar[0] + delta);
+            athena_next_line(athena, down);
+        }
+        dw->len = 0;
+        return;
+    }
+
     for (int y = 0; y < lines; y++) {
         const uint8_t *trans = &trans_masks[tsel][(dw->selline & 3) * 4];
         int            x     = scanleft ? dw->fxright : dw->fxleft;
