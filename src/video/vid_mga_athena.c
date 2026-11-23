@@ -271,6 +271,7 @@ typedef struct athena_t {
     uint8_t  aux[16];
     uint8_t  dac_idx;   /* TVP3026 index register, as last written */
     uint8_t  dac_last;  /* last byte read from the RAMDAC */
+    char     mode_desc[160]; /* last mode logged at Summary level */
     uint8_t  pos_46e8;
 
     /* External device space (DUBIC / VIWIC / clock generator / expansion):
@@ -742,6 +743,19 @@ athena_recalctimings(svga_t *svga)
 
     svga->disable_blink = (svga->bpp > 4);
     video_force_resize_set_monitor(1, svga->monitor_index);
+
+    if (athena->log_level >= LOG_SUMMARY) {
+        char   desc[160];
+        double hz = (double) cpuclock * (double) (1ULL << 32) / svga->clock;
+
+        snprintf(desc, sizeof(desc), "%s %dx%d %dbpp, pixel clock %.2f MHz, totals %dx%d, offset %d, start %X, CRTC_CTRL %X",
+                 (athena->config & CFG_VGAEN) ? "VGA" : "Power Graphic", svga->hdisp, svga->dispend, svga->bpp,
+                 hz / 1000000.0, svga->htotal, svga->vtotal, svga->rowoffset, svga->memaddr_latch, athena->crtc_ctrl);
+        if (strcmp(desc, athena->mode_desc)) {
+            strcpy(athena->mode_desc, desc);
+            athena_log(athena, LOG_SUMMARY, "Athena: mode %s\n", desc);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
